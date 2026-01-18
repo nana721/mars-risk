@@ -53,13 +53,15 @@ class MarsNativeBinner(MarsTransformer):
         self,
         features: Optional[List[str]] = None,
         method: Literal["cart", "quantile", "uniform"] = "quantile",
+        *,
         n_bins: int = 5,
         special_values: Optional[List[Union[int, float, str]]] = None,
         missing_values: Optional[List[Union[int, float, str]]] = None,
         min_samples: float = 0.05,
-        n_jobs: int = -1,
+        cart_params: Optional[Dict[str, Any]] = None,
         remove_empty_bins: bool = False,
-        join_threshold: int = 100
+        join_threshold: int = 100,
+         n_jobs: int = -1,
     ) -> None:
         """
         初始化分箱器。
@@ -81,13 +83,15 @@ class MarsNativeBinner(MarsTransformer):
             缺失值列表 (如 -1, "unknown")。将被归类为 "Missing" (Index = -1)。
         min_samples : float, default=0.05
             仅对 method='cart' 有效。叶子节点最小样本比例。
-        n_jobs : int, default=-1
-            仅对 method='cart' 有效。并行核心数，-1 表示使用所有可用核心。
+        cart_params : Dict[str, Any], optional
+            仅对 method='cart' 有效。传递给 Sklearn 决策树的额外参数字典。
         remove_empty_bins : bool, default=False
             仅对 method='uniform' 有效。是否扫描全表以剔除样本数为0的空箱。
             在大宽表场景下关闭此项可显著提升速度。
         join_threshold : int, default=100
             类别特征路由阈值。基数超过此值时，Transform 阶段将由 `replace` 模式切换为 `join` 模式以提升性能。
+        n_jobs : int, default=-1
+            仅对 method='cart' 有效。并行核心数，-1 表示使用所有可用核心。
         """
         super().__init__()
         self.features: Optional[List[str]] = features
@@ -97,6 +101,13 @@ class MarsNativeBinner(MarsTransformer):
         self.special_values: List[Any] = special_values if special_values is not None else []
         self.missing_values: List[Any] = missing_values if missing_values is not None else []
         self.min_samples: float = min_samples
+        self.cart_params = {
+            "class_weight": None, 
+            "random_state": 42,
+            "min_impurity_decrease": 0.0
+        }
+        if cart_params:
+            self.cart_params.update(cart_params)
         # 智能设置 CPU 核心数，保留一个核心给系统
         self.n_jobs: int = max(1, multiprocessing.cpu_count() - 1) if n_jobs == -1 else n_jobs
         self.remove_empty_bins: bool = remove_empty_bins
@@ -228,8 +239,6 @@ class MarsNativeBinner(MarsTransformer):
         # 3. 检查 CART 方法的依赖
         if y is None and self.method == "cart":
             raise ValueError("Decision Tree Binning ('cart') requires target 'y'.")
-
-        logger.info(f"⚙️ Fitting bins for {len(valid_cols)} features (Native Mode: {self.method})...")
 
         # 4. 策略分发
         if self.method == "quantile":
@@ -376,7 +385,6 @@ class MarsNativeBinner(MarsTransformer):
                     .value_counts().implode().alias(f"{c}_counts")
                 )
 
-            logger.info(f"⚡ Batch scanning {len(pending_optimization_cols)} columns for empty bins...")
             batch_counts_df = X.select(batch_exprs)
             
             # 解析并剔除 Count=0 的箱
@@ -424,7 +432,7 @@ class MarsNativeBinner(MarsTransformer):
                 cart = DecisionTreeClassifier(
                     max_leaf_nodes=self.n_bins,
                     min_samples_leaf=self.min_samples,
-                    random_state=42
+                    **self.cart_params
                 )
                 cart.fit(x_clean_np, y_clean_np)
                 cuts = cart.tree_.threshold[cart.tree_.threshold != -2]
@@ -432,15 +440,13 @@ class MarsNativeBinner(MarsTransformer):
                 return col_name, [float('-inf')] + cuts + [float('inf')]
             except Exception:
                 return col_name, [float('-inf'), float('inf')]
-
-        logger.info(f"⚙️ Pre-processing {len(cols)} features for CART...")
         
         raw_exclude = self.special_values + self.missing_values
         
         # 任务生成器：按需生成数据
         def task_generator():
             for c in cols:
-                # ✅ [Critical Fix] 类型安全过滤，防止在 Int 列上查询 "unknown" 报错
+                # [Fix] 类型安全过滤，防止在 Int 列上查询 "unknown" 报错
                 safe_exclude = self._get_safe_values(X.schema[c], raw_exclude)
 
                 # Polars 极速预处理：过滤 -> 转换 Float32
@@ -460,8 +466,6 @@ class MarsNativeBinner(MarsTransformer):
                 y_clean = valid_df["y"].to_numpy(writable=False)
                 
                 yield c, x_clean, y_clean
-
-        logger.info(f"🚀 Starting parallel DT fitting with n_jobs={self.n_jobs}...")
         
         results = Parallel(n_jobs=self.n_jobs, backend="threading", verbose=0)(
             delayed(worker)(name, x, y) for name, x, y in task_generator()
@@ -473,7 +477,7 @@ class MarsNativeBinner(MarsTransformer):
     @time_it
     def _materialize_woe(self) -> None:
         """
-        [极速 WOE 物化引擎 v7.0]
+        [WOE 物化引擎]
         
         **为什么这样做？**
         Transform 阶段如果每次都实时计算 WOE，对于 2000+ 特征的宽表，
@@ -535,8 +539,7 @@ class MarsNativeBinner(MarsTransformer):
             # Step D: 强制内存断层
             del X_batch_bin
             gc.collect()
-            
-        logger.info(f"✅ [V7.0] Materialization finished for {len(self.bin_woes_)} features.")
+
 
     def _transform_impl(
         self, 
@@ -803,7 +806,6 @@ class MarsNativeBinner(MarsTransformer):
         
         current_cols = X_bin_lazy.collect_schema().names()
         bin_cols = [c for c in current_cols if c.endswith("_bin")]
-        logger.info(f"📊 Lazily computing risk metrics for {len(bin_cols)} features...")
 
         # 利用 unpivot 实现矩阵化并行聚合计划
         # (rows * cols) -> (rows * features, 2)
@@ -846,7 +848,7 @@ class MarsNativeBinner(MarsTransformer):
         ])
 
         # 最终物理物化
-        stats_df = lf_stats.collect(streaming=True)
+        stats_df: pl.DataFrame = lf_stats.collect(streaming=True)
         
         # 关联标签并计算总 IV
         final_list = []
@@ -862,7 +864,7 @@ class MarsNativeBinner(MarsTransformer):
             self.bin_woes_[orig_name] = dict(zip(feat_stats["bin_index"].to_list(), feat_stats["woe"].to_list()))
             final_list.append(feat_stats)
 
-        result_df = pl.concat(final_list)
+        result_df: pl.DataFrame = pl.concat(final_list)
         iv_sum = result_df.group_by("feature").agg(pl.col("bin_iv").sum().alias("total_iv"))
         return result_df.join(iv_sum, on="feature")
 
@@ -1000,8 +1002,6 @@ class MarsOptimalBinner(MarsNativeBinner):
         if not num_cols and not cat_cols and not null_cols:
             logger.warning("No valid numeric or categorical columns found.")
             return
-        
-        logger.info(f"📊 Features identified: {len(num_cols)} Numeric, {len(cat_cols)} Categorical, {len(null_cols)} All-Null.")
 
         # 注册全空列
         for c in null_cols:
@@ -1013,14 +1013,11 @@ class MarsOptimalBinner(MarsNativeBinner):
         if cat_cols:
             self._fit_categorical_pipeline(X, y_np, cat_cols)
 
+    @time_it
     def _fit_numerical_pipeline(self, X: pl.DataFrame, y_np: np.ndarray, num_cols: List[str]) -> None:
         """
         [Pipeline] 数值型特征混合动力处理流水线。
         """
-        logger.info(f"🚀 [Numeric Pipeline] Starting Hybrid Engine for {len(num_cols)} features...")
-        
-        # --- Stage 1: 极速预分箱 (Pre-binning) ---
-        logger.info(f"   [Stage 1] Pre-binning with Polars (Method: {self.method}, Pre-bins: {self.n_prebins})...")
         
         pre_binner = MarsNativeBinner(
             features=num_cols,
@@ -1043,14 +1040,8 @@ class MarsOptimalBinner(MarsNativeBinner):
                 self.bin_cuts_[col] = cuts 
 
         if not active_cols:
-            logger.info("   [Stage 1] Completed. No features require further optimization.")
             return
-
-        logger.info(f"   [Stage 1] Completed. {len(active_cols)} features passed to Solver.")
-        
         # --- Stage 2: 并行优化 (Optimization) ---
-        logger.info(f"   [Stage 2] Optimizing with Solver (Engine: {self.solver}, TimeLimit: {self.time_limit}s)...")
-        
         def num_worker(col: str, pre_cuts: List[float], col_data: np.ndarray) -> Tuple[str, List[float]]:
             fallback_res = (col, pre_cuts)
             try:
@@ -1068,7 +1059,9 @@ class MarsOptimalBinner(MarsNativeBinner):
                     return fallback_res
                 
                 opt = OptimalBinning(
-                    name=col, dtype="numerical", solver=self.solver,
+                    name=col, 
+                    dtype="numerical", 
+                    solver=self.solver,
                     monotonic_trend=self.monotonic_trend,
                     user_splits=user_splits,  
                     max_n_bins=self.n_bins,   
@@ -1088,7 +1081,6 @@ class MarsOptimalBinner(MarsNativeBinner):
                 return fallback_res 
             except Exception:
                 return fallback_res
-
         task_gen = (
             (c, pre_cuts_map[c], X.select(c).to_series().to_numpy()) 
             for c in active_cols
@@ -1100,14 +1092,11 @@ class MarsOptimalBinner(MarsNativeBinner):
         
         for col, cuts in results:
             self.bin_cuts_[col] = cuts
-        
-        logger.info(f"✅ [Numeric Pipeline] Optimization finished for {len(active_cols)} features.")
 
     def _fit_categorical_pipeline(self, X: pl.DataFrame, y_np: np.ndarray, cat_cols: List[str]) -> None:
         """
         [Pipeline] 类别型特征处理流水线 (带 Top-K 优化)。
         """
-        logger.info(f"🚀 [Categorical Pipeline] Optimizing {len(cat_cols)} features (Top-K Cutoff: {self.cat_cutoff})...")
 
         def cat_worker(col: str, col_data_raw: np.ndarray) -> Tuple[str, Optional[List[List[Any]]]]:
             try:
@@ -1155,8 +1144,6 @@ class MarsOptimalBinner(MarsNativeBinner):
         for col, splits in results:
             if splits is not None:
                 self.cat_cuts_[col] = splits
-        
-        logger.info(f"✅ [Categorical Pipeline] Finished. Rules generated for {len(self.cat_cuts_)} features.")
 
     def _transform_impl(
         self, 

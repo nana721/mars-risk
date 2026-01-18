@@ -7,6 +7,7 @@ from sklearn.base import BaseEstimator, TransformerMixin
 
 from mars.core.exceptions import NotFittedError, DataTypeError
 from mars.utils.decorators import time_it
+import warnings
 
 
 class MarsBaseEstimator(BaseEstimator):
@@ -17,10 +18,21 @@ class MarsBaseEstimator(BaseEstimator):
     允许用户在管道中灵活控制输出格式（Pandas 或 Polars）。
     """
     
+    # Polars 的数值类型集合 (类属性，避免重复创建)
+    _PL_NUMERIC_TYPES = {
+        pl.Int8, pl.Int16, pl.Int32, pl.Int64, 
+        pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64, 
+        pl.Float32, pl.Float64
+    }
+
     def __init__(self) -> None:
         # 内部标志位：是否返回 Pandas 格式
         # 默认 False (返回 Polars)，但在 _ensure_polars 中会根据输入自动调整
         self._return_pandas: bool = False
+        
+        # 用户配置：记录 set_output 的设定 ('default', 'pandas', 'polars')
+        # 优先级高于输入类型的自动推断
+        self._output_config: str = "default"
 
     def set_output(self, transform: Literal["default", "pandas", "polars"] = "default") -> "MarsBaseEstimator":
         """
@@ -38,35 +50,54 @@ class MarsBaseEstimator(BaseEstimator):
         MarsBaseEstimator
             返回实例本身以支持链式调用。
         """
+        if transform not in ["default", "pandas", "polars"]:
+            raise ValueError(f"Unknown output format: {transform}")
+            
+        self._output_config = transform
+        
+        # 立即应用配置 (虽然主要逻辑在 _ensure_polars 中，但这里设置好状态是个好习惯)
         if transform == "pandas":
             self._return_pandas = True
-        elif transform == "polars" or transform == "default":
+        elif transform == "polars":
             self._return_pandas = False
+            
         return self
+
+    def _determine_output_format(self, input_is_pandas: bool) -> None:
+        """
+        [决策逻辑] 根据用户配置(_output_config)和输入类型，决定最终输出格式。
+        
+        决策优先级: set_output > 输入类型
+        """
+        if self._output_config == "pandas":
+            self._return_pandas = True
+        elif self._output_config == "polars":
+            self._return_pandas = False
+        else: # default
+            self._return_pandas = input_is_pandas
 
     def _ensure_polars(self, X: Any) -> Union[pl.DataFrame, pl.LazyFrame]:
         """
         [类型守卫] 确保输入数据转换为 Polars DataFrame/LazyFrame，并执行严格校验。
+        同时根据输入类型设置默认的输出格式。
         """
-        # Case 1: 已经是 Polars Eager
-        if isinstance(X, pl.DataFrame):
-            return X
-            
-        # Case 2: 是 Polars Lazy
-        elif isinstance(X, pl.LazyFrame):
+        # Case 1: 已经是 Polars (Eager or Lazy)
+        if isinstance(X, (pl.DataFrame, pl.LazyFrame)):
+            self._determine_output_format(input_is_pandas=False)
             return X
 
-        # Case 3: 是 Pandas (重点修改区域)
+        # Case 2: 是 Pandas (重点修改区域)
         elif isinstance(X, pd.DataFrame):
-            self._return_pandas = True
+            # 1. 决定输出格式 (关键修复点：使用 _determine_output_format 替代直接赋值)
+            self._determine_output_format(input_is_pandas=True)
             
-            # 1. 执行转换 (尽可能 Zero-Copy)
+            # 2. 执行转换 (尽可能 Zero-Copy)
             try:
                 X_pl = pl.from_pandas(X)
             except Exception as e:
                 raise DataTypeError(f"Failed to convert Pandas DataFrame to Polars: {e}")
             
-            # 2. 🛡️【新增】执行转换后的类型一致性检查
+            # 3. 🛡️【新增】执行转换后的类型一致性检查
             self._validate_conversion(X, X_pl)
             
             return X_pl
@@ -80,13 +111,6 @@ class MarsBaseEstimator(BaseEstimator):
         """
         [安全检查] 对比 Pandas 和 Polars 的 Schema，防止数值类型意外崩坏为字符串。
         """
-        # Polars 的数值类型集合
-        PL_NUMERIC_TYPES = {
-            pl.Int8, pl.Int16, pl.Int32, pl.Int64, 
-            pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64, 
-            pl.Float32, pl.Float64
-        }
-        
         for col in df_pd.columns:
             pd_dtype = df_pd[col].dtype
             pl_dtype = df_pl[col].dtype
@@ -95,7 +119,7 @@ class MarsBaseEstimator(BaseEstimator):
             # 检查 1: 严格拦截 (Pandas 明确是数值 -> Polars 变成了非数值)
             # ------------------------------------------------------------------
             is_pd_numeric = pd.api.types.is_numeric_dtype(pd_dtype)
-            is_pl_numeric = pl_dtype in PL_NUMERIC_TYPES
+            is_pl_numeric = pl_dtype in self._PL_NUMERIC_TYPES
             
             if is_pd_numeric and not is_pl_numeric:
                 # 允许例外: Pandas Int -> Polars Null (全空列可能发生)
@@ -134,7 +158,6 @@ class MarsBaseEstimator(BaseEstimator):
                     looks_like_numeric = False
                 
                 if looks_like_numeric:
-                    import warnings
                     warnings.warn(
                         f"\n⚠️  [Potential Dirty Data] Column '{col}' looks numeric but is treated as String.\n"
                         f"   - Input (Pandas): object (mixed types)\n"
@@ -210,24 +233,28 @@ class MarsTransformer(MarsBaseEstimator, TransformerMixin, ABC):
         self._is_fitted = True
         return self
 
-    def transform(self, X: Any) -> Union[pl.DataFrame, pd.DataFrame]:
+    def transform(self, X: Any, **kwargs) -> Any:
+        """
+        模板方法：Transform。
+        
+        支持通过 **kwargs 向 _transform_impl 传递额外参数 (如 return_type)。
+        """
         if not self._is_fitted:
             raise NotFittedError(f"{self.__class__.__name__} is not fitted.")
         
-        # 嗅探输入类型 (注意：transform 时输入 Pandas，也会触发输出 Pandas)
+        # 1. 类型转换 (Pandas -> Polars)
         X_pl = self._ensure_polars(X)
         
-        # 执行 Polars 逻辑
-        X_new = self._transform_impl(X_pl)
+        # 2. 核心逻辑 (支持参数透传)
+        X_new = self._transform_impl(X_pl, **kwargs)
         
-        # 格式化输出 (Pandas/Polars)
+        # 3. 输出格式化 (Polars -> Pandas/List/Dict)
         return self._format_output(X_new)
 
     @abstractmethod
     def _fit_impl(self, X: pl.DataFrame, y=None, **kwargs): 
         """
         [Abstract Core] 子类必须实现的核心拟合逻辑。
-        必须返回 Polars DataFrame。
         """
         pass
 
@@ -235,5 +262,6 @@ class MarsTransformer(MarsBaseEstimator, TransformerMixin, ABC):
     def _transform_impl(self, X: pl.DataFrame) -> pl.DataFrame: 
         """
         [Abstract Core] 子类必须实现的核心转换逻辑。
+        必须返回 Polars DataFrame。
         """
         pass

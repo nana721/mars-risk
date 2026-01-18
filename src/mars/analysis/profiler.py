@@ -15,7 +15,7 @@ from mars.utils.date import MarsDate
 
 class MarsDataProfiler(MarsBaseEstimator):
     """
-    MarsDataProfiler - 基于 Polars 的高性能多维数据画像工具。
+    [MarsDataProfiler] 基于 Polars 的高性能多维数据画像工具。
 
     专为大规模风控建模数据集设计。它作为分析流程的入口，封装了从
     数据质量诊断、统计值计算到可视化生成的全链路逻辑。
@@ -317,8 +317,6 @@ class MarsDataProfiler(MarsBaseEstimator):
             # 常规模式：profile_by 必须是现有列
             if profile_by not in self.df.columns:
                 raise ValueError(f"Column '{profile_by}' not found. Did you forget to set `dt_col`?")
-
-        logger.info(f"Starting profiling (Group: {group_col}, Sparkline: {run_config.enable_sparkline})...")
         
         # 3. 计算全量概览 (Overview) 
         #    Overview 总是基于原始 self.df (或 working_df，不影响结果)
@@ -351,8 +349,6 @@ class MarsDataProfiler(MarsBaseEstimator):
                     stat_tables["psi"] = psi_df
             except Exception as e:
                 logger.warning(f"⚠️ PSI calculation skipped due to error: {e}")
-
-        logger.info("Profile generated successfully.")
 
         return MarsProfileReport(
             overview=self._format_output(overview_df),
@@ -814,8 +810,6 @@ class MarsDataProfiler(MarsBaseEstimator):
 
         num_cols = [c for c in candidates if self._is_numeric(c)]
         cat_cols = [c for c in candidates if c not in num_cols]
-        
-        logger.info(f"🚀 PSI Calc: {len(num_cols)} numeric + {len(cat_cols)} categorical.")
 
         try:
             baseline_group = target_df.select(pl.col(group_col).min()).item()
