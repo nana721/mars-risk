@@ -1351,7 +1351,7 @@ class MarsDataProfiler(MarsBaseEstimator):
             当前列中应当被视为“非正常数值”的列表。
             列表中的元素类型保证与 `col` 的数据类型兼容 (例如数值列只返回数值，字符串列只返回字符串)。
         """
-        # 1. 合并两个列表 (假设你在 __init__ 里已经定义了 self.special_values)
+        # 1. 合并两个列表 
         # 如果 self.special_values 还没定义，就用空列表代替
         special_vals = getattr(self, "special_values", [])
         candidates = self.custom_missing + special_vals
@@ -1363,7 +1363,7 @@ class MarsDataProfiler(MarsBaseEstimator):
         is_num = self._is_numeric(col)
         is_str = self.df[col].dtype == pl.String
 
-        # 3. 类型安全过滤 (Type-Safe Filtering)
+        # 3. 类型安全过滤
         valid_values = []
         for v in candidates:
             # 只有当 值类型 与 列类型 匹配时，才加入列表

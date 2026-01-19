@@ -3,11 +3,12 @@ from typing import Any, List, Optional, Union, Literal
 
 import polars as pl
 import pandas as pd
+import numpy as np
 from sklearn.base import BaseEstimator, TransformerMixin
 
 from mars.core.exceptions import NotFittedError, DataTypeError
 from mars.utils.decorators import time_it
-import warnings
+from mars.utils.logger import logger
 
 
 class MarsBaseEstimator(BaseEstimator):
@@ -27,7 +28,7 @@ class MarsBaseEstimator(BaseEstimator):
 
     def __init__(self) -> None:
         # 内部标志位：是否返回 Pandas 格式
-        # 默认 False (返回 Polars)，但在 _ensure_polars 中会根据输入自动调整
+        # 默认 False (返回 Polars)，但在 _ensure_polars_dataframe 中会根据输入自动调整
         self._return_pandas: bool = False
         
         # 用户配置：记录 set_output 的设定 ('default', 'pandas', 'polars')
@@ -43,7 +44,7 @@ class MarsBaseEstimator(BaseEstimator):
         transform : Literal["default", "pandas", "polars"]
             - "pandas": 强制输出 Pandas DataFrame。
             - "polars": 强制输出 Polars DataFrame。
-            - "default": 保持默认行为 (通常跟随输入类型)。
+            - "default": 保持默认行为, 跟随输入类型。
 
         Returns
         -------
@@ -76,7 +77,7 @@ class MarsBaseEstimator(BaseEstimator):
         else: # default
             self._return_pandas = input_is_pandas
 
-    def _ensure_polars(self, X: Any) -> Union[pl.DataFrame, pl.LazyFrame]:
+    def _ensure_polars_dataframe(self, X: Any) -> Union[pl.DataFrame, pl.LazyFrame]:
         """
         [类型守卫] 确保输入数据转换为 Polars DataFrame/LazyFrame，并执行严格校验。
         同时根据输入类型设置默认的输出格式。
@@ -88,7 +89,7 @@ class MarsBaseEstimator(BaseEstimator):
 
         # Case 2: 是 Pandas (重点修改区域)
         elif isinstance(X, pd.DataFrame):
-            # 1. 决定输出格式 (关键修复点：使用 _determine_output_format 替代直接赋值)
+            # 1. 决定输出格式
             self._determine_output_format(input_is_pandas=True)
             
             # 2. 执行转换 (尽可能 Zero-Copy)
@@ -106,6 +107,28 @@ class MarsBaseEstimator(BaseEstimator):
             raise DataTypeError(f"Input must be a generic DataFrame (2D), got Series (1D): {type(X)}")
         else:
             raise DataTypeError(f"Mars expects Polars/Pandas DataFrame, got {type(X)}")
+        
+    def _ensure_polars_series(self, y: Any, name: str = "target") -> Optional[pl.Series]:
+        """[类型守卫] 确保标签 y 转换为 Polars Series。"""
+        if y is None:
+            return None
+            
+        if isinstance(y, pl.Series):
+            return y
+            
+        if isinstance(y, pd.Series):
+            return pl.from_pandas(y)
+            
+        if isinstance(y, np.ndarray):
+            # 确保 1D 数组
+            if y.ndim > 1:
+                y = y.ravel()
+            return pl.Series(name=name, values=y)
+            
+        if isinstance(y, list):
+            return pl.Series(name=name, values=y)
+            
+        return pl.Series(name=name, values=y)
 
     def _validate_conversion(self, df_pd: pd.DataFrame, df_pl: pl.DataFrame):
         """
@@ -158,7 +181,7 @@ class MarsBaseEstimator(BaseEstimator):
                     looks_like_numeric = False
                 
                 if looks_like_numeric:
-                    warnings.warn(
+                    logger.warning(
                         f"\n⚠️  [Potential Dirty Data] Column '{col}' looks numeric but is treated as String.\n"
                         f"   - Input (Pandas): object (mixed types)\n"
                         f"   - Output (Polars): Utf8\n"
@@ -189,7 +212,7 @@ class MarsBaseEstimator(BaseEstimator):
         if not self._return_pandas:
             return data
 
-        # 递归处理字典 (常见于 stats_reports)
+        # 递归处理字典 (见 stats_reports)
         if isinstance(data, dict):
             return {k: self._format_output(v) for k, v in data.items()}
         
@@ -221,12 +244,21 @@ class MarsTransformer(MarsBaseEstimator, TransformerMixin, ABC):
     def get_feature_names_out(self, input_features=None) -> List[str]:
         return self.feature_names_in_
 
-    def fit(self, X: Any, y: Optional[Any] = None, **kwargs) -> "MarsTransformer":
-        # 嗅探输入类型 + 转 Polars
-        X_pl = self._ensure_polars(X)
+    def fit(
+        self, 
+        X: pl.DataFrame | pd.DataFrame, 
+        y: Optional[pl.Series | pd.Series | np.ndarray | list[Any]] = None, 
+        **kwargs
+    ) -> "MarsTransformer":
         
-        # 执行核心逻辑
-        self._fit_impl(X_pl, y, **kwargs)
+        # 检查 X 和 y 的索引一致性
+        if isinstance(X, pd.DataFrame) and isinstance(y, pd.Series):
+            if not X.index.equals(y.index):
+                logger.warn("X and y have different indices. Polars will align them by position.")
+                
+        X_pl = self._ensure_polars_dataframe(X)
+        y_pl = self._ensure_polars_series(y)
+        self._fit_impl(X_pl, y_pl, **kwargs)
         
         # 更新状态
         self.feature_names_in_ = X_pl.columns
@@ -242,13 +274,10 @@ class MarsTransformer(MarsBaseEstimator, TransformerMixin, ABC):
         if not self._is_fitted:
             raise NotFittedError(f"{self.__class__.__name__} is not fitted.")
         
-        # 1. 类型转换 (Pandas -> Polars)
-        X_pl = self._ensure_polars(X)
-        
-        # 2. 核心逻辑 (支持参数透传)
+        X_pl = self._ensure_polars_dataframe(X)
         X_new = self._transform_impl(X_pl, **kwargs)
         
-        # 3. 输出格式化 (Polars -> Pandas/List/Dict)
+        # 输出格式化 (Polars -> Pandas/List/Dict)
         return self._format_output(X_new)
 
     @abstractmethod
