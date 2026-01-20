@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import Any, List, Optional, Union, Literal
+import re
 
 import polars as pl
 import pandas as pd
@@ -134,6 +135,16 @@ class MarsBaseEstimator(BaseEstimator):
         """
         [安全检查] 对比 Pandas 和 Polars 的 Schema，防止数值类型意外崩坏为字符串。
         """
+        # 定义需要跳过启发式检查的列名模式
+        # 1. 常见的 ID 类后缀/前缀
+        # 2. 常见的时间日期类关键词
+        SKIP_PATTERNS = re.compile(
+            r".*(_id|_dt|_at|_ts|_date|_time|_on)$|"  # 后缀: user_id, created_at, login_ts
+            r"^(id_|date_|time_|ts_)|"                # 前缀: id_code, date_str
+            r"^(id|dt|ts|year|month|day|hour|minute|second)$", # 精确匹配
+            re.IGNORECASE
+        )
+
         for col in df_pd.columns:
             pd_dtype = df_pd[col].dtype
             pl_dtype = df_pl[col].dtype
@@ -145,42 +156,40 @@ class MarsBaseEstimator(BaseEstimator):
             is_pl_numeric = pl_dtype in self._PL_NUMERIC_TYPES
             
             if is_pd_numeric and not is_pl_numeric:
-                # 允许例外: Pandas Int -> Polars Null (全空列可能发生)
                 if pl_dtype == pl.Null:
                     continue
-                    
-                raise DataTypeError(
-                    f"❌ Critical Type Mismatch for column '{col}'! \n"
-                    f"   Pandas (Numeric): {pd_dtype} \n"
-                    f"   Polars (Non-Numeric): {pl_dtype}\n"
-                    "   This usually implies data corruption during conversion (e.g. overflow or encoding issues)."
-                )
+                raise DataTypeError(f"❌ Critical Type Mismatch for column '{col}'...")
 
             # ------------------------------------------------------------------
-            # 检查 2: 脏数据陷阱预警 (Pandas Object -> Polars Utf8)
+            # 检查 2: 脏数据陷阱预警 (针对 Object -> Utf8 的启发式嗅探)
             # ------------------------------------------------------------------
             if pd_dtype == "object" and pl_dtype == pl.Utf8:
-                # 策略: 取前 10 个非空值进行嗅探
-                # 这是一个极低开销的操作 (Zero-Copy Slice)
-                sample_series = df_pl[col].drop_nulls().head(10)
                 
+                # --- 新增过滤逻辑 ---
+                # 如果命中了 ID 或 时间类的命名规则，直接跳过警告逻辑
+                if SKIP_PATTERNS.match(str(col)):
+                    continue
+                # --------------------
+
+                sample_series = df_pl[col].drop_nulls().head(10)
                 if sample_series.len() == 0:
                     continue
                 
-                # 获取样本数据
                 samples = sample_series.to_list()
                 
-                # 启发式检查: 尝试看样本是否都能转为 float
-                # 如果样本里全是数字字符串 (如 "1.5", "20", "NaN")，说明这很可能是被脏数据污染的数值列
                 looks_like_numeric = True
                 try:
                     for s in samples:
-                        # 尝试转换，如果含有 "unknown" 等非数字字符，float() 会抛出 ValueError
+                        # 排除掉纯空格或空字符串的干扰
+                        if isinstance(s, str) and not s.strip():
+                            looks_like_numeric = False
+                            break
                         float(s)
-                except ValueError:
+                except (ValueError, TypeError):
                     looks_like_numeric = False
                 
                 if looks_like_numeric:
+                    # 修复了上一轮提到的 logging 参数错误
                     logger.warning(
                         f"\n⚠️  [Potential Dirty Data] Column '{col}' looks numeric but is treated as String.\n"
                         f"   - Input (Pandas): object (mixed types)\n"
@@ -188,7 +197,6 @@ class MarsBaseEstimator(BaseEstimator):
                         f"   - Sample Values: {samples[:5]}...\n"
                         f"   -> Risk: This column will be handled as Categorical. If it contains dirty strings "
                         f"(e.g. 'null', 'unknown'), please clean them upstream or add them to 'missing_values'.",
-                        UserWarning,
                         stacklevel=2
                     )
 

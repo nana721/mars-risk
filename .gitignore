@@ -28,3 +28,4 @@ data/
 output/
 secret_config.py
 .env
+.ipynb

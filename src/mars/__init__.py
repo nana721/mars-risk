@@ -1,6 +1,6 @@
 import sys
 
-__version__ = "0.0.1" 
+__version__ = "0.0.2" 
 
 _BANNER = r"""
     __________________________________________________________________________
@@ -17,8 +17,8 @@ _BANNER = r"""
     __________________________________________________________________________
 """.format(ver=__version__)
 
-if hasattr(sys, 'ps1') or 'ipykernel' in sys.modules:
-    print(_BANNER)
+# if hasattr(sys, 'ps1') or 'ipykernel' in sys.modules:
+#     print(_BANNER)
 
 def __repr__():
     return _BANNER

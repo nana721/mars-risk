@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mars-risk"      
-version = "0.0.1"       
+version = "0.0.2"       
 description = "High-performance Risk Modeling Toolkit powered by Polars"
 readme = "README.md"
 requires-python = ">=3.10" # 推荐 3.10 或 3.11 以获得最佳性能
@@ -16,36 +16,41 @@ authors = [
 
 # 核心依赖列表 (The Golden Standard)
 dependencies = [
-    # --- Core Engine ---
-    "polars>=1.0.0",       # 使用 1.0+ 稳定版 API
-    "numpy>=1.24.0",       # 基础科学计算
-    "pandas>=2.0.0",       # 兼容性支持
-    "pyarrow>=14.0.0",     # 零拷贝数据交换核心库
+    # 1. 数据引擎 (Data Engine)
+    "polars>=1.0.0",       # 核心算力
+    "numpy>=1.24.0",       # 数值计算基础
+    "pandas>=2.0.0",       # 兼容性/接口适配
+    "pyarrow>=14.0.0",     # 零拷贝交换 (Polars <-> Pandas)
 
-    # --- Machine Learning (GBDT) ---
-    "xgboost>=2.0.0",      # 原生支持 Polars 接口
-    "lightgbm>=4.3.0",     # 更好的稳定性与 Mac 支持
-    "catboost>=1.2.0",     # 类别特征处理神器
+    # 2. 算法核心 (Algorithms)
+    "scikit-learn>=1.3.0", # 用于 NativeBinner 的决策树分箱
+    "scipy>=1.10.0",       # 基础统计 (Sklearn 依赖)
+    "optbinning>=0.19.0",  # 【新增】MarsOptimalBinner 必须依赖它
 
-    # --- Mathematics & Stats ---
-    "scipy>=1.10.0",       # 统计计算
-    "scikit-learn>=1.3.0", # 决策树分箱
-
-    # --- Utilities ---
-    "tqdm>=4.66.0",        # 进度条
-    "joblib>=1.3.0",       # 并行计算
+    # 3. 基础工具 (Utils)
+    "joblib>=1.3.0",       # 并行计算 (MarsNativeBinner/OptimalBinner)
     "colorlog>=6.7.0",     # 日志美化
-    "psutil>=5.9.0"        # 内存监控
 ]
 
 # 安装命令: pip install -e ".[dev]"
 [project.optional-dependencies]
+
+# 机器学习模型支持 (仅当用户需要用你的库跑模型时安装)
+ml = [
+    "xgboost>=2.0.0",
+    "lightgbm>=4.3.0",
+    "catboost>=1.2.0"
+]
+
+# 开发与测试环境
 dev = [
-    "pytest>=7.4.0",       # 单元测试
-    "black>=23.0.0",       # 代码格式化
-    "jupyterlab>=4.0.0",   # 交互式开发
-    "matplotlib>=3.7.0",   # (可选) 如果需要画图
-    "seaborn>=0.12.0"      # (可选) 如果需要画图
+    "pytest>=7.4.0",
+    "black>=23.0.0",
+    "jupyterlab>=4.0.0",
+    "matplotlib>=3.7.0",   # 绘图库放在这里
+    "seaborn>=0.12.0",
+    "tqdm>=4.66.0",        # 如果测试脚本需要进度条
+    "psutil>=5.9.0"        # 如果测试脚本需要监控内存
 ]
 
 # 自动发现包配置
