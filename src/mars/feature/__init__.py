@@ -1,4 +1,4 @@
-from .binning import MarsNativeBinner, MarsOptimalBinner
+from .binner import MarsNativeBinner, MarsOptimalBinner
 
 __all__ = [
     "MarsNativeBinner",

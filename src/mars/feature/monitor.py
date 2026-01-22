@@ -38,10 +38,10 @@ class MarsFeatureMonitor(MarsBaseEstimator):
     def fit(self, X_train: Any, y_train: Any = None) -> "MarsFeatureMonitor":
         """[模式 A/B] 显式设定基准"""
         logger.info("⚙️ [Monitor] Establishing baseline...")
-        X_pl = self._ensure_polars(X_train)
+        X_pl = self._ensure_polars_dataframe(X_train)
         
         # 1. 转换得到箱号 (返回结果包含 raw cols + bin cols)
-        X_trans = self.binner.transform(X_pl.select(self.features), return_type="index")
+        X_trans: pl.DataFrame = self.binner.transform(X_pl.select(self.features), return_type="index")
         
         # [FIX] 提取 _bin 列并重命名为 feature 原名
         # 这样 unpivot 出来的 bin_idx 才是真正的箱号
@@ -76,7 +76,7 @@ class MarsFeatureMonitor(MarsBaseEstimator):
         baseline: Literal["fixed", "auto"] = "fixed"
     ) -> MarsMonitorReport:
         """[核心] 计算分组监控指标"""
-        X_pl = self._ensure_polars(data)
+        X_pl = self._ensure_polars_dataframe(data)
         
         # 1. 时间处理
         group_col = f"_grp_{period}"
@@ -95,7 +95,7 @@ class MarsFeatureMonitor(MarsBaseEstimator):
 
         # 2. 分箱映射
         logger.info("🔄 [Monitor] Binning data...")
-        X_trans = self.binner.transform(X_pl.select(self.features), return_type="index")
+        X_trans: pl.DataFrame = self.binner.transform(X_pl.select(self.features), return_type="index")
         
         # [FIX] 关键修复：只取 _bin 列并重命名
         bin_cols = [f"{c}_bin" for c in self.features]

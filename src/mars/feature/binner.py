@@ -130,7 +130,6 @@ class MarsBinnerBase(MarsTransformer):
     def to_dict(self) -> Dict[str, Any]:
         """
         将分箱器状态序列化为 Python 字典。
-        用于生产环境直接加载配置，无需重新 fit。
         """
         return {
             "params": {
@@ -138,12 +137,16 @@ class MarsBinnerBase(MarsTransformer):
                 "special_values": self.special_values,
                 "missing_values": self.missing_values,
                 "join_threshold": self.join_threshold,
+                # 注意：子类可能还有额外的 params (如 solver)，
+                # 如果要完美设计，这里应该通过 self.__dict__ 过滤或让子类重写
             },
             "state": {
                 "bin_cuts_": self.bin_cuts_,
-                "cat_cuts_": self.cat_cuts_,
+                "cat_cuts_": getattr(self, "cat_cuts_", {}), # 兼容可能没有 cat_cuts_ 的情况
                 "bin_mappings_": self.bin_mappings_,
                 "bin_woes_": self.bin_woes_,
+                # [新增] 保存失败记录，使用 getattr 防止未 fit 时报错
+                "fit_failures_": getattr(self, "fit_failures_", {}) 
             }
         }
 
@@ -154,13 +157,45 @@ class MarsBinnerBase(MarsTransformer):
         """
         # 实例化一个空对象
         instance = cls(**data["params"])
+        
         # 恢复训练后的状态
-        instance.bin_cuts_ = data["state"]["bin_cuts_"]
-        instance.cat_cuts_ = data["state"]["cat_cuts_"]
-        instance.bin_mappings_ = data["state"]["bin_mappings_"]
-        instance.bin_woes_ = data["state"]["bin_woes_"]
+        state = data["state"]
+        instance.bin_cuts_ = state.get("bin_cuts_", {})
+        instance.cat_cuts_ = state.get("cat_cuts_", {})
+        instance.bin_mappings_ = state.get("bin_mappings_", {})
+        instance.bin_woes_ = state.get("bin_woes_", {})
+        
+        # [新增] 恢复失败记录
+        instance.fit_failures_ = state.get("fit_failures_", {})
+        
         instance._is_fitted = True
         return instance
+    
+    # =========================================
+    # ⬇新增：序列化安全控制 (防止保存训练数据)
+    # =========================================
+    def __getstate__(self):
+        """
+        Pickle 序列化时的钩子。
+        在保存模型时，自动剔除巨大的训练数据缓存，只保留配置和计算结果。
+        """
+        state = self.__dict__.copy()
+        # 移除大数据缓存，防止模型文件变成几百 MB
+        state["_cache_X"] = None
+        state["_cache_y"] = None
+        return state
+
+    def __setstate__(self, state):
+        """
+        Pickle 反序列化时的钩子。
+        恢复模型状态，并将缓存初始化为 None。
+        """
+        self.__dict__.update(state)
+        # 确保属性存在，防止 AttributeError
+        if "_cache_X" not in self.__dict__:
+            self._cache_X = None
+        if "_cache_y" not in self.__dict__:
+            self._cache_y = None
 
 
     def _get_safe_values(self, dtype: pl.DataType, values: List[Any]) -> List[Any]:
@@ -418,8 +453,10 @@ class MarsBinnerBase(MarsTransformer):
                 layer_missing = pl.when(missing_cond).then(pl.lit(IDX_MISSING, dtype=pl.Int16))
                 
                 # 2. 正常分箱逻辑: Cut
-                breaks = cuts[1:-1] if len(cuts) > 2 else []
-                
+                # 【修改点】：增加 set去重 和 sorted排序，防止 pl.cut 报错
+                raw_breaks = cuts[1:-1] if len(cuts) > 2 else []
+                breaks = sorted(list(set(raw_breaks)))
+
                 col_mapping: Dict[int, str] = {IDX_MISSING: "Missing", IDX_OTHER: "Other"} # 分箱标签映射表 IDX -> Label
                 
                 # 2.1 处理无切点情况
@@ -488,8 +525,8 @@ class MarsBinnerBase(MarsTransformer):
                     for val in group: 
                         val_str = str(val)
                         cat_to_idx[val_str] = i
-                        # 【新增】如果训练时这一箱含有 "Other_Pre"，则将其设为默认箱
-                        if val_str == "Other_Pre":
+                        # 【新增】如果训练时这一箱含有 "__Mars_Other_Pre__"，则将其设为默认箱
+                        if val_str == "__Mars_Other_Pre__":
                             default_bin_idx = i
                 
                 self.bin_mappings_[col] = idx_to_label
@@ -514,34 +551,21 @@ class MarsBinnerBase(MarsTransformer):
                             .otherwise(current_branch)
                         )
                 
-                # 3. 路由: Join (高基数) vs Replace (低基数)
-                # Join 模式避免了在表达式中构建巨大的 when-then 树，极大提升性能
-                # if len(cat_to_idx) > self.join_threshold:
-                #     map_df = pl.DataFrame({
-                #         "_k": list(cat_to_idx.keys()), 
-                #         f"_idx_{col}": list(cat_to_idx.values())
-                #     }).with_columns([
-                #         pl.col("_k").cast(pl.Utf8),
-                #         pl.col(f"_idx_{col}").cast(pl.Int16)
-                #     ])
-                #     # 兼容 Lazy 模式的 Join
-                #     join_tbl = map_df.lazy() if isinstance(X, pl.LazyFrame) else map_df
-                #     X = X.join(join_tbl, left_on=target_col, right_on="_k", how="left")
-                    
-                #     temp_join_cols.append(f"_idx_{col}")
                 target_col_name = col
                 if col_dtype != pl.Utf8:
                     target_col_name = f"_{col}_utf8_tmp"
                     X = X.with_columns(pl.col(col).cast(pl.Utf8).alias(target_col_name))
 
+                #  3. 路由: Join (高基数) vs Replace (低基数)
                 if len(cat_to_idx) > self.join_threshold:
                     map_df = pl.DataFrame({
                         "_k": list(cat_to_idx.keys()), 
                         f"_idx_{col}": list(cat_to_idx.values())
                     }).cast({"_k": pl.Utf8, f"_idx_{col}": pl.Int16})
                     
-                    # left_on 必须传字符串
-                    X = X.join(map_df, left_on=target_col_name, right_on="_k", how="left")
+                    # 修复：根据 X 的类型自适应转换 map_df
+                    join_tbl = map_df.lazy() if isinstance(X, pl.LazyFrame) else map_df
+                    X = X.join(join_tbl, left_on=target_col_name, right_on="_k", how="left")
                     temp_join_cols.append(f"_idx_{col}")
                     if target_col_name != col: temp_join_cols.append(target_col_name)
                     
@@ -727,12 +751,17 @@ class MarsBinnerBase(MarsTransformer):
         for feat_name in bin_cols:
             orig_name = feat_name.replace("_bin", "")
             
-            # 【修改】：查找键必须是元组 (feat_name,)
+            # 【修改】：更安全的字典 Key 查找
+            # partition_by(as_dict=True) 返回的 Key 通常是 tuple，但也可能因版本差异有变
+            # 优先尝试 tuple key，若失败则尝试直接 key (兼容性防御)
             dict_key = (feat_name,)
-            if dict_key not in stats_dict: 
-                continue
             
-            feat_stats = stats_dict[dict_key]
+            if dict_key in stats_dict:
+                feat_stats = stats_dict[dict_key]
+            elif feat_name in stats_dict: # 防御性逻辑：万一 Polars 返回的不是 tuple
+                feat_stats = stats_dict[feat_name]
+            else:
+                continue # 如果都找不到，跳过
             
             # --- 核心状态同步 ---
             if update_woe:
@@ -744,7 +773,7 @@ class MarsBinnerBase(MarsTransformer):
             mapping = self.get_bin_mapping(orig_name)
             # --- 自定义排序逻辑 ---
             feat_stats = (
-                feat_stats
+                feat_stats 
                 .with_columns([
                     pl.col("bin_index").cast(pl.Utf8)
                     .replace({str(k): v for k, v in mapping.items()})
@@ -807,7 +836,6 @@ class MarsNativeBinner(MarsBinnerBase):
         special_values: Optional[List[Union[int, float, str]]] = None,
         missing_values: Optional[List[Union[int, float, str]]] = None,
         min_samples: float = 0.05,
-        min_bin_samples_multiplier: float = 10,
         cart_params: Optional[Dict[str, Any]] = None,
         remove_empty_bins: bool = False,
         join_threshold: int = 100,
@@ -833,9 +861,6 @@ class MarsNativeBinner(MarsBinnerBase):
             自定义缺失值列表。默认 None, NaN 会自动识别并归为 Missing 箱。
         min_samples : float, default=0.05
             仅在 method='cart' 时有效。决策树叶子节点的最小样本占比。
-        min_bin_samples_multiplier : float, default=10
-            最小样本量安全水位系数。
-            计算公式：`min_rows = n_bins * multiplier`。若特征有效样本量低于该值，则不切分。
         cart_params : Dict, optional
             透传给 sklearn.tree.DecisionTreeClassifier 的额外参数。
         remove_empty_bins : bool, default=False
@@ -852,7 +877,6 @@ class MarsNativeBinner(MarsBinnerBase):
         )
         self.method = method
         self.min_samples = min_samples
-        self.min_bin_samples_multiplier = min_bin_samples_multiplier
         self.remove_empty_bins = remove_empty_bins
         
         self.cart_params = {
@@ -998,6 +1022,11 @@ class MarsNativeBinner(MarsBinnerBase):
           `missing_values` 临时替换为 `Null`，确保切点的分布仅由业务层面的“正常值”决定。
         - 自动去重：针对高偏态数据（如某些取值极度集中的分位数一致），会自动执行 `set()` 
           去重并重新排序，防止生成重复切点导致的 `Cut Error`。
+        
+        **[新增] 低基数优化 (Low Cardinality Optimization)**
+        - 针对二值/离散整数 (如 0/1)，Quantile 往往会切出 [0.0, 1.0] 这种尴尬边界。
+        - 优化逻辑：若特征唯一值数量 <= n_bins，自动降级为"中点切分" (Midpoint)，
+          例如 [0, 1] 会被切在 0.5，生成完美的两个箱子。
 
         Algorithm
         ---------
@@ -1015,42 +1044,105 @@ class MarsNativeBinner(MarsBinnerBase):
         # 预处理排除值
         raw_exclude = self.special_values + self.missing_values
         
-        # 2. 构建表达式列表
-        q_exprs = []
+        # -------------------------------------------------------------
+        # Step 1: 批量计算 n_unique，用于路由低基数逻辑
+        # -------------------------------------------------------------
+        # 这一步开销很小，Polars 针对数值列的 n_unique 有极速优化
+        unique_exprs = []
         for c in cols:
-            # 获取当前列安全的排除值
             safe_exclude = self._get_safe_values(X.schema[c], raw_exclude)
             target_col = pl.col(c)
-            # 如果有需要排除的值，在计算分位数前先置为 Null (不参与计算)
             if safe_exclude:
-                target_col = pl.when(pl.col(c).is_in(safe_exclude)).then(None).otherwise(pl.col(c))
+                target_col = target_col.filter(~pl.col(c).is_in(safe_exclude))
+            unique_exprs.append(target_col.n_unique().alias(c))
             
-            for i, q in enumerate(quantiles):
-                # 别名技巧: col:::idx，便于后续解析
-                alias_name = f"{c}:::{i}"
-                q_exprs.append(target_col.quantile(q).alias(alias_name))
+        unique_counts = X.select(unique_exprs).row(0)
+        col_unique_map = dict(zip(cols, unique_counts))
         
-        # 3. 触发计算 (One-Shot Query)
-        stats = X.select(q_exprs)
-        row = stats.row(0)
+        # 分流：哪些列走 Quantile，哪些列走 Midpoint (中点)
+        quantile_cols = []
+        low_card_cols = []
         
-        # 4. 解析结果并去重排序
-        temp_cuts: Dict[str, List[float]] = {c: [] for c in cols}
-        
-        for val, name in zip(row, stats.columns):
-            c_name, _ = name.split(":::")
-            if val is not None and not np.isnan(val):
-                temp_cuts[c_name].append(val)
-
         for c in cols:
-            cuts = sorted(list(set(temp_cuts[c]))) 
+            # 如果唯一值比箱数还少，算分位数没有意义，直接切中点
+            if col_unique_map[c] <= self.n_bins:
+                low_card_cols.append(c)
+            else:
+                quantile_cols.append(c)
+
+        # -------------------------------------------------------------
+        # Step 2: 处理高基数列 (标准 Quantile 逻辑)
+        # -------------------------------------------------------------
+        if quantile_cols:
+            q_exprs = []
+            for c in quantile_cols:
+                # 获取当前列安全的排除值
+                safe_exclude = self._get_safe_values(X.schema[c], raw_exclude)
+                target_col = pl.col(c)
+                # 如果有需要排除的值，在计算分位数前先置为 Null (不参与计算)
+                if safe_exclude:
+                    target_col = pl.when(pl.col(c).is_in(safe_exclude)).then(None).otherwise(pl.col(c))
+                
+                for i, q in enumerate(quantiles):
+                    # 别名技巧: col:::idx，便于后续解析
+                    alias_name = f"{c}:::{i}"
+                    q_exprs.append(target_col.quantile(q).alias(alias_name))
             
-            # 【微调】：记录退化特征，与 MarsOptimalBinner 的行为对齐
-            if not cuts:
-                if not hasattr(self, "fit_failures_"): self.fit_failures_ = {}
-                self.fit_failures_[c] = "Degenerate feature: insufficient distinct quantiles (highly zero-inflated)."
-            
-            self.bin_cuts_[c] = [float('-inf')] + cuts + [float('inf')]
+            # 3. 触发计算 (One-Shot Query)
+            if q_exprs:
+                stats = X.select(q_exprs)
+                row = stats.row(0)
+                
+                # 4. 解析结果并去重排序
+                temp_cuts: Dict[str, List[float]] = {c: [] for c in quantile_cols}
+                
+                for val, name in zip(row, stats.columns):
+                    c_name, _ = name.split(":::")
+                    if val is not None and not np.isnan(val):
+                        temp_cuts[c_name].append(val)
+
+                for c in quantile_cols:
+                    cuts = sorted(list(set(temp_cuts[c]))) 
+                    
+                    # 【微调】：记录退化特征，与 MarsOptimalBinner 的行为对齐
+                    if not cuts:
+                        if not hasattr(self, "fit_failures_"): self.fit_failures_ = {}
+                        self.fit_failures_[c] = "Degenerate feature: insufficient distinct quantiles (highly zero-inflated)."
+                    
+                    self.bin_cuts_[c] = [float('-inf')] + cuts + [float('inf')]
+
+        # -------------------------------------------------------------
+        # Step 3: 处理低基数列 (中点切分优化)
+        # -------------------------------------------------------------
+        if low_card_cols:
+            for c in low_card_cols:
+                safe_exclude = self._get_safe_values(X.schema[c], raw_exclude)
+                
+                # 获取唯一值并排序
+                # 这里的 unique 已经是全量 unique 减去 null，但还需要排除 safe_exclude
+                unique_vals = (
+                    X.select(pl.col(c).unique())
+                    .to_series()
+                    .sort()
+                    .to_list()
+                )
+                
+                # 手动清洗 (Python侧)，因为唯一值极少，速度很快
+                clean_vals = [v for v in unique_vals if v is not None and (not isinstance(v, float) or not np.isnan(v))]
+                if safe_exclude:
+                    clean_vals = [v for v in clean_vals if v not in safe_exclude]
+                
+                if len(clean_vals) <= 1:
+                    # 只有一个值，无法切分
+                    self.bin_cuts_[c] = [float('-inf'), float('inf')]
+                    if not hasattr(self, "fit_failures_"): 
+                        self.fit_failures_ = {}
+                    self.fit_failures_[c] = "Degenerate feature: single unique value."
+                else:
+                    # 计算中点: (a+b)/2
+                    # 例如 [0, 1] -> 切点 0.5 -> [-inf, 0.5, inf] (完美2箱)
+                    mid_points = [(clean_vals[k] + clean_vals[k+1])/2 for k in range(len(clean_vals)-1)]
+                    self.bin_cuts_[c] = [float('-inf')] + mid_points + [float('inf')]
 
     def _fit_uniform(self, X: pl.DataFrame, cols: List[str]) -> None:
         """
@@ -1252,15 +1344,27 @@ class MarsNativeBinner(MarsBinnerBase):
         
         if len(y_np) != X.height:
             raise ValueError(f"Target 'y' length mismatch: X({X.height}) vs y({len(y_np)})")
+        
+        
+        n_total_samples = X.height
 
         def worker(col_name: str, x_clean_np: np.ndarray, y_clean_np: np.ndarray) -> Tuple[str, List[float]]:
             try:
-                if len(x_clean_np) < self.n_bins * self.min_bin_samples_multiplier:
-                    return col_name, [float('-inf'), float('inf')], "Insufficient samples after cleaning."
+                # 如果 min_samples 是浮点数 (如 0.05)，则基于 总行数(n_total_samples) 计算
+                # 而不是基于 过滤后的行数(len(x_clean_np)) 计算
+                if isinstance(self.min_samples, float):
+                    min_samples_abs = int(np.ceil(self.min_samples * n_total_samples))
+                else:
+                    min_samples_abs = self.min_samples
+
+                # 安全检查：如果清洗后的数据量甚至不足以支撑 2 个最小叶子节点
+                # 说明该特征在有效值范围内过于稀疏，不应强行分箱
+                if len(x_clean_np) < 2 * min_samples_abs:
+                     return col_name, [float('-inf'), float('inf')], "Insufficient clean samples to satisfy global min_samples."
                 
                 cart = DecisionTreeClassifier(
                     max_leaf_nodes=self.n_bins,
-                    min_samples_leaf=self.min_samples,
+                    min_samples_leaf=min_samples_abs,
                     **self.cart_params
                 )
                 cart.fit(x_clean_np, y_clean_np)
@@ -1364,14 +1468,18 @@ class MarsOptimalBinner(MarsBinnerBase):
         features: Optional[List[str]] = None,
         cat_features: Optional[List[str]] = None,
         n_bins: int = 5,
+        min_n_bins: int = 1,
+        min_bin_size: float = 0.05,
         n_prebins: int = 50,
         prebinning_method: Literal["quantile", "uniform", "cart"] = "cart",
+        min_prebin_size: float = 0.05,
         monotonic_trend: Literal["ascending", "descending", "auto", "auto_asc_desc"] = "auto_asc_desc",
         solver: Literal["cp", "mip"] = "cp",
         time_limit: int = 10,
         cat_cutoff: Optional[int] = 100,
         special_values: Optional[List[Any]] = None,
         missing_values: Optional[List[Any]] = None,
+        cart_params: Optional[Dict[str, Any]] = None,
         join_threshold: int = 100,
         n_jobs: int = -1
     ) -> None:
@@ -1381,43 +1489,82 @@ class MarsOptimalBinner(MarsBinnerBase):
         Parameters
         ----------
         features : List[str], optional
-            数值型特征列名。
+            数值型特征的列名白名单。若为 None，fit 时将自动识别所有数值列。
         cat_features : List[str], optional
-            类别型特征列名。
+            类别型特征的列名白名单。若为 None，fit 时将自动识别所有类别列。
         n_bins : int, default=5
-            最终输出的最大分箱数。
+            **最大分箱数**。最终生成的有效分箱数量不会超过此值。
+        min_n_bins : int, default=1
+            **最小分箱数**。强制求解器至少切分出多少个箱子。
+            若数据量不足以支撑此约束（触发水位熔断），将自动回退到预分箱结果。
+        min_bin_size : float, default=0.05
+            **最小箱占比约束**。
+            指定每个分箱（不含缺失值和特殊值箱）包含的样本量占总样本量的最小比例（0.0 ~ 0.5）。
+            例如 0.05 表示每箱至少包含 5% 的样本。
         n_prebins : int, default=50
-            预分箱阶段的区间数。预分箱越多，求解越慢但精度越高。
-        prebinning_method : str, default='cart'
-            预分箱策略。推荐 'cart'，因为它能更好地捕获局部非线性特征。
+            **预分箱数量**（Stage 1）。
+            在调用求解器前，先将连续变量离散化为多少个初始区间。
+            值越大，最终分箱越精细，但求解速度越慢。建议值 20~100。
+        prebinning_method : {'cart', 'quantile', 'uniform'}, default='cart'
+            **预分箱策略**。
+            - 'cart': 使用决策树进行初始切分，能较好地保留非线性趋势（推荐）。
+            - 'quantile': 等频切分。
+            - 'uniform': 等宽切分。
+        min_prebin_size : float, default=0.05
+            **预分箱的最小叶子节点占比**。
+            仅在 `prebinning_method='cart'` 时有效，控制决策树生长的精细度。
         monotonic_trend : str, default='auto_asc_desc'
-            单调性约束：'ascending', 'descending', 'auto', 'auto_asc_desc'。
+            **单调性约束**。控制分箱后 Event Rate 的趋势：
+            - 'ascending': 单调递增。
+            - 'descending': 单调递减。
+            - 'auto': 自动选择单调递增或递减（基于相关性）。
+            - 'auto_asc_desc': 尝试升序和降序，选择 IV 更高的一个（推荐）。
         solver : {'cp', 'mip'}, default='cp'
-            OptBinning 的求解引擎。'cp' (Constraint Programming) 通常在复杂约束下更快。
+            **数学规划求解引擎**。
+            - 'cp' (Constraint Programming): 约束编程，通常处理复杂约束时速度更快（推荐）。
+            - 'mip' (Mixed-Integer Programming): 混合整数规划。
         time_limit : int, default=10
-            单特征求解的最大秒数限制，超时将自动回退至预分箱结果。
-        cat_cutoff : int, optional
-            类别型特征的 Top-K 截断阈值。高基数特征（如：手机型号）会被强制截断。
-        special_values : List, optional
-            特殊值列表（如 [-999, 9999]），将独立成箱。
-        missing_values : List, optional
-            缺失值定义列表，自动归为 Missing 箱。
+            **求解超时时间**（秒）。
+            单个特征的最优分箱求解最大允许耗时。若超时，将自动回退。
+        cat_cutoff : int, optional, default=100
+            **类别特征高基数截断阈值**。
+            对于类别型特征，仅保留出现频率最高的 Top-K 个类别，其余类别将被归并为 
+            `"__Mars_Other_Pre__"`，以减少求解器的搜索空间。
+        special_values : List[Any], optional
+            **特殊值列表**。
+            这些值（如 -999, -1）将被强制剥离，分配到独立的负数索引分箱中（-3, -4...），
+            不参与最优分箱的切分计算。
+        missing_values : List[Any], optional
+            **自定义缺失值列表**。
+            除了标准的 Null/NaN 外，额外视作缺失值的内容。会被归入 Missing 箱（索引 -1）。
         join_threshold : int, default=100
-            Transform 阶段的性能开关：超过此基数将启用 Join 模式进行向量化转换。
+            **Transform 性能调优阈值**。
+            在 `transform` 阶段，若类别特征的基数超过此值，将自动启用 `Hash Join` 模式
+            替代 `Replace` 模式，以显著提升宽表转换性能。
+        cart_params : Dict[str, Any], optional
+            传递给决策树分箱器 (`sklearn.tree.DecisionTreeClassifier`) 的额外参数字典。
+            仅在 `prebinning_method='cart'` 时有效。
         n_jobs : int, default=-1
-            并行核心数。
+            **并行核心数**。
+            - `-1`: 使用所有可用核心（保留一个）。
+            - `1`: 单线程运行。
+            - `N`: 指定使用的核心数。
         """
         super().__init__(
             features=features, cat_features=cat_features, n_bins=n_bins,
             special_values=special_values, missing_values=missing_values,
             join_threshold=join_threshold, n_jobs=n_jobs
         )
+        self.min_n_bins = min_n_bins
+        self.min_bin_size = min_bin_size
         self.n_prebins = n_prebins
         self.prebinning_method = prebinning_method
+        self.min_prebin_size = min_prebin_size
         self.monotonic_trend = monotonic_trend
         self.solver = solver
         self.time_limit = time_limit
         self.cat_cutoff = cat_cutoff
+        self.cart_params = cart_params if cart_params is not None else {}
         
         # 尝试导入 optbinning
         try:
@@ -1530,14 +1677,15 @@ class MarsOptimalBinner(MarsBinnerBase):
         num_cols : List[str]
             待处理的数值列名。
         """
-        # --- Stage 1: Pre-binning (Native) ---
-        # 复用 Native 实现，速度极快
+        
         pre_binner = MarsNativeBinner(
             features=num_cols,
             method=self.prebinning_method, 
             n_bins=self.n_prebins, 
             special_values=self.special_values,
             missing_values=self.missing_values,
+            min_samples=self.min_prebin_size,
+            cart_params=self.cart_params,
             n_jobs=self.n_jobs,
             remove_empty_bins=False 
         )
@@ -1554,23 +1702,65 @@ class MarsOptimalBinner(MarsBinnerBase):
 
         if not active_cols:
             return
+        
+        # 1. 获取全局样本总数
+        n_total_samples = X.height
 
-        # --- Stage 2: Parallel Optimization ---
         def num_worker(col: str, pre_cuts: List[float], col_data: np.ndarray, y_data: np.ndarray) -> Tuple[str, List[float], Optional[str]]:
             fallback_res = (col, pre_cuts, None)
             try:
+                # 2. 计算基于"总体"的绝对 min_bin_size
+                if isinstance(self.min_bin_size, float):
+                    min_bin_size_abs = int(np.ceil(self.min_bin_size * n_total_samples))
+                else:
+                    min_bin_size_abs = self.min_bin_size # 如果用户初始化时就传了整数
+                
+                # 3. 水位熔断 (绝对值检查)
+                # 如果当前数据量 < 最小分箱数 * 最小单箱大小，直接回退
+                if len(col_data) < self.min_n_bins * min_bin_size_abs:
+                     return fallback_res
+
                 if len(col_data) < 10 or np.var(col_data) < 1e-8:
                     return col, pre_cuts, "Low variance or insufficient samples"
 
-                # 提取预切点 (去除 inf)
-                user_splits = np.array(pre_cuts[1:-1])
+                # ---------------------------------------------------------
+                # 【修复】：将绝对值转换回当前数据的相对比例
+                # ---------------------------------------------------------
+                # OptBinning 源码限制 min_bin_size 必须在 (0, 0.5] 之间
+                current_ratio = min_bin_size_abs / len(col_data)
+
+                # 如果比例超过 0.5，说明当前数据甚至无法切分出两个满足要求的箱子
+                # (例如：要求每箱至少500人，但当前只有800人，500/800 = 0.625 > 0.5)
+                if current_ratio > 0.5:
+                    return fallback_res
+                
+                # 为了防止浮点精度问题导致正好等于 0.50000001 报错，稍微做个截断保护
+                # 虽然前面的 if 已经拦截了，但为了保险起见
+                current_ratio = min(current_ratio, 0.5)
+                # ---------------------------------------------------------
+
+                raw_splits = np.array(pre_cuts[1:-1])
+                if len(raw_splits) > 1:
+                    diffs = np.diff(raw_splits)
+                    mask = np.concatenate(([True], diffs > 1e-6))
+                    user_splits = raw_splits[mask]
+                else:
+                    user_splits = raw_splits
+
                 if len(user_splits) == 0:
                     return fallback_res
                 
                 opt = OptimalBinning(
-                    name=col, dtype="numerical", solver=self.solver,
-                    monotonic_trend=self.monotonic_trend, user_splits=user_splits,  
-                    max_n_bins=self.n_bins, time_limit=self.time_limit, min_bin_size=0.05,
+                    name=col, 
+                    dtype="numerical", 
+                    solver=self.solver,
+                    monotonic_trend=self.monotonic_trend, 
+                    user_splits=user_splits, 
+                    min_n_bins=self.min_n_bins, 
+                    max_n_bins=self.n_bins, 
+                    time_limit=self.time_limit, 
+                    # 【修复】：这里传入计算后的动态比例
+                    min_bin_size=current_ratio,
                     verbose=False
                 )
                 opt.fit(col_data, y_data)
@@ -1622,7 +1812,7 @@ class MarsOptimalBinner(MarsBinnerBase):
                 if not mask_np.any():
                     continue
 
-                # 5. [核心优化] 特征列 X 处理
+                # 5. [优化] 特征列 X 处理
                 # 流程：Polars 过滤 -> 强转 Float32 -> 导出 NumPy 只读视图
                 # Float32 相比 Float64 可减少一半的通讯带宽，且不影响分箱精度
                 col_np = (
@@ -1662,8 +1852,8 @@ class MarsOptimalBinner(MarsBinnerBase):
 
         Notes
         -----
-        - **长尾截断路由 (Other_Pre)**：针对频数极低或基数极大的类别，自动执行 
-          `Top-K` 截断，并将长尾数据归并为特殊的 `Other_Pre` 类别。
+        - **长尾截断路由 (__Mars_Other_Pre__)**：针对频数极低或基数极大的类别，自动执行 
+          `Top-K` 截断，并将长尾数据归并为特殊的 `__Mars_Other_Pre__` 类别。
         - **数据源头净化**：在任务生成器中完成字符串映射和空值隔离，
           Worker 进程拿到的直接是满足 `optbinning` 输入要求的 `pl.Utf8` 映射数据。
         - **并行后端**：使用 `loky` 后端。
@@ -1679,17 +1869,17 @@ class MarsOptimalBinner(MarsBinnerBase):
         """
         raw_exclude = self.special_values + self.missing_values
 
-        # 1. 更加健壮的 Worker
+        
         def cat_worker(col: str, clean_data: np.ndarray, clean_y: np.ndarray) -> Tuple[str, Optional[List[List[Any]]], Optional[str]]:
             try:
-                # Top-K 预处理: 将长尾类别归为 "Other_Pre"
+                # Top-K 预处理: 将长尾类别归为 "__Mars_Other_Pre__"
                 if self.cat_cutoff is not None:
                     unique_vals, counts = np.unique(clean_data, return_counts=True)
                     if len(unique_vals) > self.cat_cutoff:
                         top_indices = np.argsort(-counts)[:self.cat_cutoff]
                         top_vals = set(unique_vals[top_indices])
                         mask_keep = np.isin(clean_data, list(top_vals))
-                        clean_data = np.where(mask_keep, clean_data, "Other_Pre")
+                        clean_data = np.where(mask_keep, clean_data, "__Mars_Other_Pre__")
 
                 opt = OptimalBinning(
                     name=col, dtype="categorical", solver=self.solver,
@@ -1706,7 +1896,7 @@ class MarsOptimalBinner(MarsBinnerBase):
             except Exception as e:
                 return col, None, f"{type(e).__name__}: {str(e)}"
 
-        # 2. 统一的源头清洗生成器
+        
         def cat_task_gen():
             for c in cat_cols:
                 series = X.get_column(c)
@@ -1731,7 +1921,6 @@ class MarsOptimalBinner(MarsBinnerBase):
 
                 yield c, col_data, clean_y
 
-        # 执行并行
         results = Parallel(n_jobs=self.n_jobs, backend="loky")(
             delayed(cat_worker)(c, data, y) for c, data, y in cat_task_gen()
         )

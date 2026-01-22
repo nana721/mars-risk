@@ -845,6 +845,24 @@ class MarsDataProfiler(MarsBaseEstimator):
         """
         target_df: pl.DataFrame = context_df if context_df is not None else self.df
         
+        # ==============================================================================
+        # 🛡️ [新增] 内存保护熔断机制 (Sanity Check)
+        # ==============================================================================
+        # PSI 矩阵是通过 Cross Join 生成骨架的。
+        # 如果 group_col 误传了高基数主键(如 user_id)，会导致 (N_feat * N_bins * N_users) 的内存爆炸。
+        # 设定一个安全阈值，例如 1000 (足以覆盖几十年的月份或常用的 Segment)
+        MAX_PSI_GROUPS = 1000  
+        
+        # 快速检查分组数量 (使用 approx_n_unique 极速估算，或者直接 count unique)
+        n_groups = target_df.select(pl.col(group_col).n_unique()).item()
+        
+        if n_groups > MAX_PSI_GROUPS:
+            logger.error(f"❌ PSI Calculation aborted: Column '{group_col}' has {n_groups} unique values.")
+            logger.error(f"   Threshold is {MAX_PSI_GROUPS}. Did you accidentally group by an ID column?")
+            # 返回空表，避免程序 Crash，让报告其他部分能正常生成
+            return pl.DataFrame()
+        # ==============================================================================
+        
         # 1. 确定计算范围
         candidates = features if features else self.features
         candidates = [c for c in candidates if c != group_col]
@@ -1061,8 +1079,8 @@ class MarsDataProfiler(MarsBaseEstimator):
 
     def _calc_psi_from_stats(
         self, 
-        stats_df: pl.LazyFrame,  # 修改为 LazyFrame
-        unique_bins_skel: pl.LazyFrame, # 修改为 LazyFrame
+        stats_df: pl.LazyFrame,  
+        unique_bins_skel: pl.LazyFrame, 
         group_col: str, 
         baseline_group: Any
     ) -> pl.LazyFrame: # 返回 LazyFrame
