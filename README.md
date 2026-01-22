@@ -71,7 +71,7 @@ report.write_excel("data_profile_report.xlsx") # 导出为 Excel
 
 ### 场景 2：快速特征分箱
 ```python
-from mars.feature.binning import MarsNativeBinner, MarsOptimalBinner
+from mars.feature.binner import MarsNativeBinner, MarsOptimalBinner
 
 # --- 方式 A: 快速原生分箱 (适合大规模预处理) ---
 binner = MarsNativeBinner(
