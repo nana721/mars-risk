@@ -17,7 +17,11 @@ jobs:
         python-version: ${{ matrix.python-version }}
     - name: Install dependencies
       run: |
-        pip install .[dev]
-        pip install pytest
-    # - name: Run tests
-    #   run: pytest || [ $? -eq 5 ]
+        python -m pip install --upgrade pip
+        # 安装当前项目
+        pip install . 
+
+    - name: Smoke Test (Import Check)
+      run: |
+        # 尝试导入包，如果代码有语法错误或依赖缺失，这里会报错并中断 CI
+        python -c "import mars; print('✅ Mars package imported successfully!')"
