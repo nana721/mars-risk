@@ -594,10 +594,12 @@ class MarsDataProfiler(MarsBaseEstimator):
                 target_s: pl.Series = sample_df[col]
                 
                 # --- A. 数据清洗 ---
+                if target_s.dtype in [pl.Float32, pl.Float64]:
+                    target_s = target_s.filter(target_s.is_not_nan())
+                
                 if exclude_vals:
-                    if target_s.dtype in [pl.Float32, pl.Float64]:
-                        target_s = target_s.filter(target_s.is_not_nan())
                     target_s = target_s.filter(~target_s.is_in(exclude_vals))
+                
                 s: pl.Series = target_s.drop_nulls()
                 
                 # --- B. 边界检查 ---
@@ -1229,55 +1231,68 @@ class MarsDataProfiler(MarsBaseEstimator):
             包含该列所有待计算指标的表达式列表。
         """
         
-        native_null = pl.col(col).null_count()
         total_len = pl.len()
-        valid_missing = self._get_valid_missing(col)
-        
-        # 总缺失 = 原生 Null + 自定义 Null
-        total_missing = native_null + pl.col(col).is_in(valid_missing).sum() if valid_missing else native_null
         is_num = self._is_numeric(col)
-        zeros_c = (pl.col(col) == 0).sum() if is_num else pl.lit(0, dtype=pl.UInt32)
+        exprs = []
+
+        # --- 动态生成 DQ 指标 (根据 config.dq_metrics 过滤) ---
+        dq_targets = config.dq_metrics
         
-        if self.df.height > 1_000_000:
-            unique_count_expr = pl.col(col).approx_n_unique()
-        else:
-            unique_count_expr = pl.col(col).n_unique()
+        if "missing" in dq_targets:
+            # [核心修复] 构建 联合缺失条件: 原生 Null | (如果是数值则包含 NaN) | 自定义缺失值
+            missing_cond = pl.col(col).is_null()
+            if is_num:
+                missing_cond |= pl.col(col).is_nan()
             
-        # 预计算 Top1 结构体 (避免重复写 value_counts 逻辑)
-        # value_counts 返回 struct: {col_name: value, count: int}
-        top1_struct = pl.col(col).value_counts(sort=True).first()
-        
-        # 基础 DQ 指标
-        exprs = [
-            (total_missing / total_len).alias("missing_rate"),
-            (zeros_c / total_len).alias("zeros_rate"),
-            (unique_count_expr / total_len).alias("unique_rate"),
-            (
-                pl.col(col)                         # 1. 选中目标列 (假设列名叫 "city")
+            valid_missing = self._get_valid_missing(col)
+            if valid_missing:
+                missing_cond |= pl.col(col).is_in(valid_missing)
                 
-                .value_counts(sort=True)            # 2. 统计每个值出现的次数，并按次数从多到少排序
-                                                    #    返回数据格式 (List[Struct]): 
-                                                    #    [{"city": "北京", "count": 100},  <-- 第1行 (次数最多)
-                                                    #     {"city": "上海", "count": 80},   <-- 第2行
-                                                    #     ...]
+            exprs.append((missing_cond.sum() / total_len).alias("missing_rate"))
+            
+        if "zeros" in dq_targets:
+            zeros_c = (pl.col(col) == 0).sum() if is_num else pl.lit(0, dtype=pl.UInt32)
+            exprs.append((zeros_c / total_len).alias("zeros_rate"))
+            
+        if "unique" in dq_targets:
+            if self.df.height > 1_000_000:
+                unique_count_expr = pl.col(col).approx_n_unique()
+            else:
+                unique_count_expr = pl.col(col).n_unique()
+            exprs.append((unique_count_expr / total_len).alias("unique_rate"))
+            
+        if "top1" in dq_targets:
+            # 预计算 Top1 结构体 (避免重复写 value_counts 逻辑)
+            # value_counts 返回 struct: {col_name: value, count: int}
+            top1_struct = pl.col(col).value_counts(sort=True).first()
+            
+            exprs.append(
+                (
+                    pl.col(col)                         # 1. 选中目标列 (假设列名叫 "city")
+                    
+                    .value_counts(sort=True)            # 2. 统计每个值出现的次数，并按次数从多到少排序
+                                                        #    返回数据格式 (List[Struct]): 
+                                                        #    [{"city": "北京", "count": 100},  <-- 第1行 (次数最多)
+                                                        #     {"city": "上海", "count": 80},   <-- 第2行
+                                                        #     ...]
 
-                .first()                            # 3. 只取排序后的第 1 行数据 (也就是众数的那一行)
-                                                    #    返回数据格式 (Struct): 
-                                                    #    {"city": "北京", "count": 100}
+                    .first()                            # 3. 只取排序后的第 1 行数据 (也就是众数的那一行)
+                                                        #    返回数据格式 (Struct): 
+                                                        #    {"city": "北京", "count": 100}
 
-                .struct.field("count")              # 4. 从这个结构体(Struct)中，只提取 "count" 这个字段的值
-                                                    #    返回数据: 100
+                    .struct.field("count")              # 4. 从这个结构体(Struct)中，只提取 "count" 这个字段的值
+                                                        #    返回数据: 100
 
-                / total_len                         # 5. 除以总行数 (例如总共有 1000 行)
-                                                    #    计算: 100 / 1000 = 0.1
+                    / total_len                         # 5. 除以总行数 (例如总共有 1000 行)
+                                                        #    计算: 100 / 1000 = 0.1
 
-            ).alias("top1_ratio"),                   # 6. 给这个计算结果起个名字叫 "top1_ratio"
+                ).alias("top1_ratio")                    # 6. 给这个计算结果起个名字叫 "top1_ratio"
+            )
+            
             # 增加 Top1 Value (众数具体值)
             # 强制转为 String，防止与 Mean/Std 等数值指标在 pivot 时发生类型冲突
-             top1_struct.struct.field(col).cast(pl.Utf8).alias("top1_value"),
-            
-        ]
-        
+            exprs.append(top1_struct.struct.field(col).cast(pl.Utf8).alias("top1_value"))
+
         # 动态统计指标 (基于 Config)
         # 数值统计指标
         if is_num:
@@ -1328,19 +1343,27 @@ class MarsDataProfiler(MarsBaseEstimator):
         
         # 2. 定义基础列对象 (Raw Data)
         raw_col = pl.col(col)
+        is_num = self._is_numeric(col)
+        col_dtype = self._dtype_map.get(col)
 
         # ---------------------------------------------------------
         # Group A: 数据质量指标 (基于 Raw Data 计算)
         # ---------------------------------------------------------
         if metric_type == "missing":
-            # 缺失率 = (原生 Null + 自定义特殊值) / 总行数
-            native_null = raw_col.null_count()
-            custom_missing_count = raw_col.is_in(valid_missing).sum() if valid_missing else pl.lit(0, dtype=pl.UInt32)
-            return (native_null + custom_missing_count) / pl.len()
+            # 缺失率 = (原生 Null + NaN + 自定义特殊值) / 总行数
+            # [修改] 增加对 NaN 的判定，因为 np.nan 在 Polars 中被识别为 NaN
+            missing_cond = raw_col.is_null()
+            if is_num and col_dtype in [pl.Float32, pl.Float64]:
+                missing_cond |= raw_col.is_nan()
+            
+            if valid_missing:
+                missing_cond |= raw_col.is_in(valid_missing)
+                
+            return missing_cond.sum() / pl.len()
         
         elif metric_type == "zeros":
             # 零值率 (物理意义上的 0)
-            return (raw_col == 0).sum() / pl.len() if self._is_numeric(col) else pl.lit(0, dtype=pl.UInt32)
+            return (raw_col == 0).sum() / pl.len() if is_num else pl.lit(0, dtype=pl.UInt32)
         
         elif metric_type == "unique":
             # 唯一值数量 (包含特殊值)
@@ -1353,17 +1376,21 @@ class MarsDataProfiler(MarsBaseEstimator):
         # ---------------------------------------------------------
         # Group B: 数值统计指标 (基于 Clean Data 计算)
         # ---------------------------------------------------------
-        if not self._is_numeric(col): 
+        if not is_num: 
             return pl.lit(None)
 
         # 计算统计均时，要把 Missing 和 Special 全部踢走
+        # [修改] 显式踢走 NaN，因为在 Polars 中，mean/std 遇到 NaN 会返回 NaN
+        if col_dtype in [pl.Float32, pl.Float64]:
+            clean_col = raw_col.filter(raw_col.is_not_nan())
+        else:
+            clean_col = raw_col
+
         exclude_vals = self._get_values_to_exclude(col)
         
         if exclude_vals:
             # 过滤掉不需要的值
-            clean_col = raw_col.filter(~raw_col.is_in(exclude_vals))
-        else:
-            clean_col = raw_col
+            clean_col = clean_col.filter(~raw_col.is_in(exclude_vals))
 
         mapper = {
             # 集中度

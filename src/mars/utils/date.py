@@ -6,7 +6,7 @@ class MarsDate:
     [MarsDate] 日期处理核心组件 (Pure Polars Edition).
 
     专为 Polars DataFrame 操作设计。
-    所有方法均返回 ``pl.Expr``，利用 Rust 引擎进行惰性求值和并行计算。
+    所有方法均返回 ``pl.Expr`` 对象，可直接用于 Polars 的表达式系统中。
 
     Notes
     -----

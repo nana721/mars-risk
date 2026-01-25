@@ -90,16 +90,16 @@ class MarsBaseEstimator(BaseEstimator):
 
         # Case 2: 是 Pandas (重点修改区域)
         elif isinstance(X, pd.DataFrame):
-            # 1. 决定输出格式
+            # 决定输出格式
             self._determine_output_format(input_is_pandas=True)
             
-            # 2. 执行转换 (尽可能 Zero-Copy)
+            # 转换
             try:
                 X_pl = pl.from_pandas(X)
             except Exception as e:
                 raise DataTypeError(f"Failed to convert Pandas DataFrame to Polars: {e}")
             
-            # 3. 🛡️【新增】执行转换后的类型一致性检查
+            # 转换后的类型一致性检查
             self._validate_conversion(X, X_pl)
             
             return X_pl
@@ -273,7 +273,7 @@ class MarsTransformer(MarsBaseEstimator, TransformerMixin, ABC):
         self._is_fitted = True
         return self
 
-    def transform(self, X: Any, **kwargs) -> Any:
+    def transform(self, X: Any, **kwargs) -> pl.DataFrame | pd.DataFrame | pl.LazyFrame:
         """
         模板方法：Transform。
         
