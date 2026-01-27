@@ -997,9 +997,15 @@ class MarsNativeBinner(MarsBinnerBase):
         valid_cols: List[str] = []
         stats_exprs = []
         for c in target_cols:
-            # [优化] 显式忽略 NaN
-            stats_exprs.append(pl.col(c).filter(pl.col(c).is_not_nan()).min().alias(f"{c}_min"))
-            stats_exprs.append(pl.col(c).filter(pl.col(c).is_not_nan()).max().alias(f"{c}_max"))
+            col_dtype = X.schema[c]
+            target_expr = pl.col(c)
+            
+            # 【修复】只有浮点数才做 is_not_nan 检查
+            if col_dtype in [pl.Float32, pl.Float64]:
+                target_expr = target_expr.filter(target_expr.is_not_nan())
+                
+            stats_exprs.append(target_expr.min().alias(f"{c}_min"))
+            stats_exprs.append(target_expr.max().alias(f"{c}_max"))
         stats_row = X.select(stats_exprs).row(0)
         
         for i, c in enumerate(target_cols):
@@ -1093,10 +1099,23 @@ class MarsNativeBinner(MarsBinnerBase):
         # 这一步开销很小, Polars 针对数值列的 n_unique 有极速优化
         unique_exprs = []
         for c in cols:
-            safe_exclude = self._get_safe_values(X.schema[c], raw_exclude)
-            target_col = pl.col(c).filter(pl.col(c).is_not_nan())
+            col_dtype = X.schema[c]
+            safe_exclude = self._get_safe_values(col_dtype, raw_exclude)
+            
+            # 【修复】构建联合过滤条件 (Avoid Chained Filter)
+            # 1. 基础: 非 Null
+            keep_mask = pl.col(c).is_not_null()
+            
+            # 2. 叠加: 非 NaN (仅浮点)
+            if col_dtype in [pl.Float32, pl.Float64]:
+                keep_mask &= ~pl.col(c).is_nan()
+            
+            # 3. 叠加: 非特殊值
             if safe_exclude:
-                target_col = target_col.filter(~pl.col(c).is_in(safe_exclude))
+                keep_mask &= ~pl.col(c).is_in(safe_exclude)
+                
+            # 一次性应用过滤
+            target_col = pl.col(c).filter(keep_mask)
             unique_exprs.append(target_col.n_unique().alias(c))
             
         unique_counts = X.select(unique_exprs).row(0)
@@ -1119,12 +1138,23 @@ class MarsNativeBinner(MarsBinnerBase):
         if quantile_cols:
             q_exprs = []
             for c in quantile_cols:
-                # 获取当前列安全的排除值
-                safe_exclude = self._get_safe_values(X.schema[c], raw_exclude)
-                target_col = pl.col(c).filter(pl.col(c).is_not_null() & ~pl.col(c).is_nan())
-                # 如果有需要排除的值, 在计算分位数前先置为 Null (不参与计算)
+                col_dtype = X.schema[c]
+                safe_exclude = self._get_safe_values(col_dtype, raw_exclude)
+                
+                # 【修复】构建联合过滤条件
+                # 初始条件: 非 Null
+                valid_cond = pl.col(c).is_not_null()
+                
+                # 叠加: 非 NaN (仅浮点)
+                if col_dtype in [pl.Float32, pl.Float64]:
+                    valid_cond &= ~pl.col(c).is_nan()
+                
+                # 叠加: 非 Special Values
                 if safe_exclude:
-                    target_col = pl.when(pl.col(c).is_in(safe_exclude)).then(None).otherwise(pl.col(c))
+                    valid_cond &= ~pl.col(c).is_in(safe_exclude)
+                
+                # 应用过滤
+                target_col = pl.col(c).filter(valid_cond)
                 
                 for i, q in enumerate(quantiles):
                     # 别名技巧: col:::idx, 便于后续解析
@@ -1242,12 +1272,18 @@ class MarsNativeBinner(MarsBinnerBase):
         col_safe_excludes = {} 
 
         for c in cols:
-            safe_exclude = self._get_safe_values(X.schema[c], raw_exclude)
-            col_safe_excludes[c] = safe_exclude # 缓存供后续使用
+            col_dtype = X.schema[c]
+            safe_exclude = self._get_safe_values(col_dtype, raw_exclude)
+            col_safe_excludes[c] = safe_exclude
 
-            target_col = pl.col(c).filter(~pl.col(c).is_nan())
+            # 【修复】构建联合条件
+            keep_mask = pl.lit(True)
+            if col_dtype in [pl.Float32, pl.Float64]:
+                keep_mask &= ~pl.col(c).is_nan()
             if safe_exclude:
-                target_col = target_col.filter(~pl.col(c).is_in(safe_exclude))
+                keep_mask &= ~pl.col(c).is_in(safe_exclude)
+
+            target_col = pl.col(c).filter(keep_mask)
             
             exprs.append(target_col.min().alias(f"{c}_min"))
             exprs.append(target_col.max().alias(f"{c}_max"))
@@ -1841,7 +1877,7 @@ class MarsOptimalBinner(MarsBinnerBase):
                 valid_mask = series.is_not_null()
                 
                 # 针对数值特征增加: 非 NaN 过滤
-                if col_dtype in self.NUMERIC_DTYPES:
+                if col_dtype in [pl.Float32, pl.Float64]:  # 仅对浮点数检查 NaN
                     valid_mask &= (~series.is_nan())
                 
                 # 针对业务特殊值进行排除, 如 -999, -998
