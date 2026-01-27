@@ -26,7 +26,7 @@ class MarsPlotter:
     """
     
     UNIT_WIDTH = 3  # 单个子图的基准宽度
-    UNIT_HEIGHT = 2.5 # 单个子图的基准高度
+    UNIT_HEIGHT = 2.75 # 单个子图的基准高度
 
     @staticmethod
     def _show_scrollable(fig: plt.Figure, dpi: int = 150):
@@ -227,24 +227,24 @@ class MarsPlotter:
         fig = plt.figure(figsize=(total_width, total_height))
         
         # 动态计算字体大小，适配不同尺寸的子图
-        base_h = MarsPlotter.UNIT_HEIGHT
-        fs_title = max(6, int(base_h * 1.8 + 1))
-        fs_label = max(5, int(base_h * 1.5 + 1))
-        fs_text  = max(4, int(base_h * 1.5))
+        base_h = 2.5
+        fs_title = base_h * 1.8 + 2
+        fs_label = base_h * 1.5 + 1.5
+        fs_text  = base_h * 1.5 + 1
         
         gs = gridspec.GridSpec(
             1, n_panels, 
             figure=fig,
-            wspace=0.1, 
+            wspace=0.09, 
             left=0.05, right=0.95, top=0.75, bottom=0.15 
         )
         
         # 3. 绘制顶部全局摘要信息栏
         summary_str_1 = f"{feature},  {target_name},  Total: {int(total_count)},  {time_range}"
-        summary_str_2 = f"IV: {global_iv:.3f},  KS: {global_ks*100:.1f},  AUC: {global_auc:.3f},  Missing: {miss_str},  Trend: {trend_str}"
+        summary_str_2 = f"IV: {global_iv:.3f},  KS: {global_ks*100:.1f},  AUC: {global_auc:.2f},  Missing: {miss_str},  Trend: {trend_str}"
         
-        fig.text(0.04, 0.98, summary_str_1 + "\n" + summary_str_2, 
-                 fontsize=fs_title+1, va='top', ha='left', linespacing=1.6, 
+        fig.text(0.04, 0.94, summary_str_1 + "\n" + summary_str_2, 
+                 fontsize=fs_title+0.85, va='top', ha='left', linespacing=1.6, 
                  bbox=dict(boxstyle="round,pad=0.4", fc="#f0f0f0", ec="#cccccc", alpha=0.8))
 
         # [优化] 预计算全局最大值：确保所有子图的 Y 轴刻度一致，方便跨期对比
@@ -276,7 +276,8 @@ class MarsPlotter:
                     rc_val = np.nan 
             
             for spine in ax.spines.values():
-                spine.set_linewidth(0.1)
+                spine.set_linewidth(0.2)
+                # spine.set_edgecolor('#CCCCCC')
             
             df_g = df_feat[df_feat[group_col] == group].sort_values("bin_index")
             if df_g.empty: continue
@@ -288,43 +289,47 @@ class MarsPlotter:
             bads = df_g["bad_rate"]
             
             # --- A. 柱状图：展示样本分布 (灰色) ---
-            ax.bar(x, counts, color='lightgrey', label='Count Dist', alpha=0.8)
-            ax.set_ylim(0, global_max_count * 1.6) 
+            ax.bar(x, counts, color='grey', label='Count Dist', alpha=0.4)
+            ax.set_ylim(0, global_max_count * 1.3) 
             
             if i == 0:
                 ax.yaxis.set_major_formatter(to_percent)
-                ax.tick_params(axis='y', labelsize=fs_label, colors='grey')
+                ax.tick_params(axis='y', labelsize=fs_label+1.5, colors='grey', length=0)
             else:
                 ax.set_yticks([]) # 仅保留最左侧坐标轴
             
             ax.set_xticks(x)
-            ax.set_xticklabels(labels, rotation=90, fontsize=fs_label)
+            ax.set_xticklabels(labels, rotation=90, fontsize=fs_label+1.5)
+            ax.tick_params(axis='x', length=0)
             
             # --- B. 折线图：展示坏率趋势 (红色) ---
             ax2 = ax.twinx()
+            for spine in ax2.spines.values():
+                spine.set_linewidth(0.2)       # 保持与 ax 一致的宽度
+                # spine.set_edgecolor('#CCCCCC') # 保持与 ax 一致的颜色
             mask_normal = np.array(indices) >= 0
             mask_special = ~mask_normal
             x_arr = np.array(x)
             bads_arr = np.array(bads)
             
-            COLOR_RED = '#d62728'   
+            COLOR_RED = "#fc5853"   
             COLOR_BLUE = "#210fe8" 
             COLOR_GREY = '#555555' 
             
             if mask_normal.any():
-                ax2.plot(x_arr[mask_normal], bads_arr[mask_normal], color=COLOR_RED, linewidth=0.8, zorder=1)
-                ax2.scatter(x_arr[mask_normal], bads_arr[mask_normal], color=COLOR_RED, s=3, zorder=2)
+                ax2.plot(x_arr[mask_normal], bads_arr[mask_normal], color=COLOR_RED, linewidth=1.2, zorder=1)
+                ax2.scatter(x_arr[mask_normal], bads_arr[mask_normal], color=COLOR_RED, s=6.5, zorder=2)
             
             # 特殊箱（如缺失值、拒绝、异常值）用蓝色散点标记
             if mask_special.any():
-                ax2.scatter(x_arr[mask_special], bads_arr[mask_special], color=COLOR_BLUE, s=3, zorder=2)
+                ax2.scatter(x_arr[mask_special], bads_arr[mask_special], color=COLOR_BLUE, s=6.5, zorder=2)
             
-            y_max_limit = global_max_bad * 1.4 if global_max_bad > 0 else 1.0
+            y_max_limit = global_max_bad * 1.25 if global_max_bad > 0 else 1.0
             ax2.set_ylim(0, y_max_limit)
             
             if i == len(all_groups) - 1:
                 ax2.yaxis.set_major_formatter(to_percent)
-                ax2.tick_params(axis='y', labelsize=fs_label, colors=COLOR_RED)
+                ax2.tick_params(axis='y', labelsize=fs_label+1.5, colors="#a23633", length=0)
             else:
                 ax2.set_yticks([]) # 仅保留最右侧坐标轴
             
@@ -337,16 +342,15 @@ class MarsPlotter:
                 if 'lift' in df_g.columns:
                     lift_val = df_g['lift'].iloc[j]
                     offset_up = y_max_limit * 0.02
-                    ax2.text(j, val + offset_up, f"{lift_val:.2f}", color=color_lift_text, ha='center', va='bottom', fontweight='bold', fontsize=fs_text+0.5)
+                    ax2.text(j, val + offset_up, f"{lift_val:.1f}", color=color_lift_text, ha='center', va='bottom', fontweight='bold', fontsize=fs_text+2.6)
 
                 # 标注坏率百分比（位于折线下方）
                 offset_down = y_max_limit * 0.03
-                ax2.text(j, val - offset_down, f"{val:.1%}", color=COLOR_GREY, ha='center', va='top', fontweight='bold', fontsize=fs_text)
+                ax2.text(j, val - offset_down, f"{val:.1%}", color=COLOR_GREY, ha='center', va='top', fontweight='bold', fontsize=fs_text+0.8)
                 
                 # 在柱状图内部底部标注样本分布占比
                 ct_val = counts.iloc[j]
-                ax.text(j, max(counts) * 0.05, f"{ct_val:.1%}", color='#333333', ha='center', va='bottom', fontsize=fs_text)
-
+                ax.text(j, max(counts) * 0.05, f"{ct_val:.1%}", color='#333333', ha='center', va='bottom', fontsize=fs_text+0.5)
             # --- D. 子图顶部指标汇总 ---
             iv_val  = df_g['iv_bin'].sum()
             ks_val  = df_g['ks_bin'].max() * 100
@@ -358,20 +362,20 @@ class MarsPlotter:
             total_count = df_g['count'].sum() if 'count' in df_g.columns else df_g['total_count'].iloc[0]
             avg_bad_rate = total_bad / total_count if total_count > 0 else 0
             g_miss_row = df_g[df_g['bin_index'] == -1]
-            g_miss_str = f"{g_miss_row['count'].sum() / total_count:.2%}" if not g_miss_row.empty and total_count > 0 else "0.00%"
+            g_miss_str = f"{g_miss_row['count'].sum() / total_count:.0%}" if not g_miss_row.empty and total_count > 0 else "0%"
 
             # 子图主标题
-            ax.set_title(f"{group}   ({int(total_bad)}/{int(total_count)}, {avg_bad_rate:.1%})", fontsize=fs_title, y=1.05, ha='center')
+            ax.set_title(f"{group}   ({int(total_bad)}/{int(total_count)}, {avg_bad_rate:.1%})", fontsize=fs_title+0.85, y=1.05, ha='center')
 
             # 子图副标题指标栏 (RC, PSI, IV 等)
             rc_str   = f"RC:{rc_val:.2f}" if not np.isnan(rc_val) else "RC:n.a."
             rc_color = 'red' if (not np.isnan(rc_val) and rc_val < 0.7) else '#555555'
 
-            perf_text = f"IV:{iv_val:.2f}  KS:{ks_val:.0f}  AUC:{auc_val:.2f}"
-            ax.text(0.42, 1.03, perf_text, transform=ax.transAxes, ha='right', va='bottom', fontsize=fs_title-1, color='black')
-            ax.text(0.43, 1.03, f" PSI:{psi_val:.2f}", transform=ax.transAxes, ha='left', va='bottom', fontsize=fs_title-1, color='red' if psi_val > 0.1 else 'black')
-            ax.text(0.56, 1.03, f"  {rc_str}", transform=ax.transAxes, ha='left', va='bottom', fontsize=fs_title-1, color=rc_color)
-            ax.text(0.69, 1.03, f"  Missing:{g_miss_str}", transform=ax.transAxes, ha='left', va='bottom', fontsize=fs_title-1, color='#555555')
+            perf_text = f"IV: {iv_val:.2f},  KS: {ks_val:.1f},  AUC: {auc_val:.2f},"
+            ax.text(0.602, 1.015, perf_text, transform=ax.transAxes, ha='right', va='bottom', fontsize=fs_title+0.85, color='black')
+            ax.text(0.607, 1.015, f"  PSI: {psi_val:.2f},", transform=ax.transAxes, ha='left', va='bottom', fontsize=fs_title+0.85, color='red' if psi_val > 0.1 else 'black')
+            ax.text(0.82, 0.95, f" {rc_str}", transform=ax.transAxes, ha='left', va='bottom', fontsize=fs_title+0.65, color=rc_color)
+            ax.text(0.837, 1.015, f" Miss:{g_miss_str}", transform=ax.transAxes, ha='left', va='bottom', fontsize=fs_title+0.85, color='#555555')
 
             # 绘制整体平均坏率参考线
             ax2.axhline(avg_bad_rate, color='grey', linestyle='--', alpha=0.5, linewidth=0.8)
@@ -384,7 +388,7 @@ class MarsPlotter:
                     lft, bd = row.get('lift', 0), int(row.get('bad', 0))
                     rt = bd / total_bad if total_bad > 0 else 0
                     text = f"{suffix}: {lft:.2f}, {bd}, {rt:.1%}"
-                    ax.text(0.02, 0.96 if suffix=="L" else 0.89, text, transform=ax.transAxes, color=COLOR_BLUE, fontsize=fs_text+1, ha='left', va='top')
+                    ax.text(0.02, 0.987 if suffix=="L" else 0.935, text, transform=ax.transAxes, color=COLOR_BLUE, fontsize=fs_text+1.8, ha='left', va='top')
 
         MarsPlotter._show_scrollable(fig, dpi=dpi)
         
