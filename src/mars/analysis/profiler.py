@@ -1381,20 +1381,20 @@ class MarsDataProfiler(MarsBaseEstimator):
             return pl.lit(None)
 
         # 构建一个统一的布尔掩码 (Keep Mask)，而不是分步 filter
-        # 初始条件：全部保留
         keep_mask = pl.lit(True)
-
-        # 显式踢走 NaN，因为在 Polars 中，mean/std 遇到 NaN 会返回 NaN
-        # 1. 如果是浮点数，必须排除 NaN
         if col_dtype in [pl.Float32, pl.Float64]:
-            keep_mask &= raw_col.is_not_nan()
+            # 浮点数必须同时排除 Null 和 NaN
+            keep_mask &= raw_col.is_not_nan() & raw_col.is_not_null()
+        else:
+            keep_mask &= raw_col.is_not_null()
 
-        # 2. 如果有自定义剔除值 (如 -999)，也叠加到掩码中
         exclude_vals = self._get_values_to_exclude(col)
         if exclude_vals:
             keep_mask &= ~raw_col.is_in(exclude_vals)
 
-        # 3. 一次性应用掩码，确保上下文长度一致
+        # 【决策】这里使用 filter，因为后续涉及 quantile/median 计算。
+        # filter 会物理减少数据量，这对于排序类操作(Sorting-based ops)性能更优，
+        # 且在 generate_profile 中我们只返回标量(Scalar)，不会导致列长度不一致的问题。
         clean_col = raw_col.filter(keep_mask)
 
         mapper = {

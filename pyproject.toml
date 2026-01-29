@@ -14,22 +14,22 @@ authors = [
   {name = "christian", email = "lee_sq001@163.com"}
 ]
 
-# 核心依赖列表 (The Golden Standard)
+
 dependencies = [
-    # 1. 数据引擎 (Data Engine)
-    "polars>=1.0.0",       # 核心算力
-    "numpy>=1.24.0",       # 数值计算基础
-    "pandas>=2.0.0",       # 兼容性/接口适配
-    "pyarrow>=14.0.0",     # 零拷贝交换 (Polars <-> Pandas)
+    
+    "polars>=1.0.0",     
+    "numpy>=1.24.0",      
+    "pandas>=2.0.0",     
+    "pyarrow>=14.0.0",    
 
-    # 2. 算法核心 (Algorithms)
-    "scikit-learn>=1.3.0", # 用于 NativeBinner 的决策树分箱
-    "scipy>=1.10.0",       # 基础统计 (Sklearn 依赖)
-    "optbinning>=0.19.0",  # 【新增】MarsOptimalBinner 必须依赖它
+   
+    "scikit-learn>=1.3.0", 
+    "scipy>=1.10.0",       
+    "optbinning>=0.19.0",  
 
-    # 3. 基础工具 (Utils)
-    "joblib>=1.3.0",       # 并行计算 (MarsNativeBinner/OptimalBinner)
-    "colorlog>=6.7.0",     # 日志美化
+    
+    "joblib>=1.3.0",       
+    "colorlog>=6.7.0",    
 ]
 
 # 安装命令: pip install -e ".[dev]"
@@ -47,10 +47,10 @@ dev = [
     "pytest>=7.4.0",
     "black>=23.0.0",
     "jupyterlab>=4.0.0",
-    "matplotlib>=3.7.0",   # 绘图库放在这里
+    "matplotlib>=3.7.0",   
     "seaborn>=0.12.0",
-    "tqdm>=4.66.0",        # 如果测试脚本需要进度条
-    "psutil>=5.9.0"        # 如果测试脚本需要监控内存
+    "tqdm>=4.66.0",        
+    "psutil>=5.9.0"        
 ]
 
 # 自动发现包配置

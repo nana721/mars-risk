@@ -131,23 +131,33 @@ class MarsBaseEstimator(BaseEstimator):
             
         return pl.Series(name=name, values=y)
 
-    def _validate_conversion(self, df_pd: pd.DataFrame, df_pl: pl.DataFrame):
+    def _validate_conversion(self, df_pd: pd.DataFrame, df_pl: Union[pl.DataFrame, pl.LazyFrame]):
         """
         [安全检查] 对比 Pandas 和 Polars 的 Schema，防止数值类型意外崩坏为字符串。
         """
+        # ------------------------------------------------------------------
+        # 1. 预处理：针对 LazyFrame 必须先取样，否则无法直接索引或分析数据内容
+        # ------------------------------------------------------------------
+        if isinstance(df_pl, pl.LazyFrame):
+            # 仅取前 100 行进行启发式校验，兼顾性能与安全
+            check_df = df_pl.head(100).collect()
+        else:
+            check_df = df_pl
+
+        # 获取 Polars Schema (字典格式，查询效率更高)
+        pl_schema = check_df.schema
+
         # 定义需要跳过启发式检查的列名模式
-        # 1. 常见的 ID 类后缀/前缀
-        # 2. 常见的时间日期类关键词
         SKIP_PATTERNS = re.compile(
-            r".*(_id|_dt|_at|_ts|_date|_time|_on)$|"  # 后缀: user_id, created_at, login_ts
-            r"^(id_|date_|time_|ts_)|"                # 前缀: id_code, date_str
+            r".*(_id|_dt|_at|_ts|_date|_time|_on)$|"  # 后缀: user_id, created_at
+            r"^(id_|date_|time_|ts_)|"                # 前缀: id_code
             r"^(id|dt|ts|year|month|day|hour|minute|second)$", # 精确匹配
             re.IGNORECASE
         )
 
         for col in df_pd.columns:
             pd_dtype = df_pd[col].dtype
-            pl_dtype = df_pl[col].dtype
+            pl_dtype = pl_schema.get(col)
             
             # ------------------------------------------------------------------
             # 检查 1: 严格拦截 (Pandas 明确是数值 -> Polars 变成了非数值)
@@ -156,22 +166,28 @@ class MarsBaseEstimator(BaseEstimator):
             is_pl_numeric = pl_dtype in self._PL_NUMERIC_TYPES
             
             if is_pd_numeric and not is_pl_numeric:
+                # 容忍全空列 (Polars 默认推断为 Null 类型)
                 if pl_dtype == pl.Null:
                     continue
-                raise DataTypeError(f"❌ Critical Type Mismatch for column '{col}'...")
+                raise DataTypeError(
+                    f"❌ [Critical Type Mismatch] Column '{col}' is numeric in Pandas ({pd_dtype}) "
+                    f"but converted to non-numeric in Polars ({pl_dtype}). "
+                    f"Check for mixed dtypes in your Pandas DataFrame."
+                )
 
             # ------------------------------------------------------------------
             # 检查 2: 脏数据陷阱预警 (针对 Object -> Utf8 的启发式嗅探)
             # ------------------------------------------------------------------
             if pd_dtype == "object" and pl_dtype == pl.Utf8:
                 
-                # --- 新增过滤逻辑 ---
+                # --- 过滤逻辑 ---
                 # 如果命中了 ID 或 时间类的命名规则，直接跳过警告逻辑
                 if SKIP_PATTERNS.match(str(col)):
                     continue
                 # --------------------
 
-                sample_series = df_pl[col].drop_nulls().head(10)
+                # 获取样本数据进行探测
+                sample_series = check_df[col].drop_nulls().head(10)
                 if sample_series.len() == 0:
                     continue
                 
@@ -180,16 +196,17 @@ class MarsBaseEstimator(BaseEstimator):
                 looks_like_numeric = True
                 try:
                     for s in samples:
-                        # 排除掉纯空格或空字符串的干扰
-                        if isinstance(s, str) and not s.strip():
+                        # 排除掉纯空格、空字符串或长 ID 类数字的干扰
+                        # 风控建议：ID 类通常较长，如果长度超过 15 位且是纯数字，通常不需要预警
+                        s_str = str(s).strip()
+                        if not s_str or (s_str.isdigit() and len(s_str) > 15):
                             looks_like_numeric = False
                             break
-                        float(s)
+                        float(s_str)
                 except (ValueError, TypeError):
                     looks_like_numeric = False
                 
                 if looks_like_numeric:
-                    # 修复了上一轮提到的 logging 参数错误
                     logger.warning(
                         f"\n⚠️  [Potential Dirty Data] Column '{col}' looks numeric but is treated as String.\n"
                         f"   - Input (Pandas): object (mixed types)\n"

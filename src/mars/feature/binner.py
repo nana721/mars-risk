@@ -768,7 +768,7 @@ class MarsBinnerBase(MarsTransformer):
 
         # 计算 KS 和 AUC
         # 注意: 计算 AUC 必须按照风险 (WOE)升序排序, 以形成正确的 ROC 曲线
-        lf_stats = lf_stats.sort(["feature", "woe"]).with_columns([
+        lf_stats = lf_stats.sort(["feature", "woe", "bin_index"]).with_columns([
             pl.col("bad_dist").cum_sum().over("feature").alias("cum_bad_dist"),
             pl.col("good_dist").cum_sum().over("feature").alias("cum_good_dist")
         ])
@@ -776,7 +776,7 @@ class MarsBinnerBase(MarsTransformer):
         lf_stats = lf_stats.with_columns([
             (pl.col("cum_bad_dist") - pl.col("cum_good_dist")).abs().alias("bin_ks"),
             # AUC 贡献度计算
-            ((pl.col("cum_good_dist") - pl.col("cum_good_dist").shift(1).over("feature").fill_null(0)) * (pl.col("cum_bad_dist") + pl.col("cum_bad_dist").shift(1).over("feature").fill_null(0)) / 2
+            ((pl.col("cum_good_dist") - pl.col("cum_good_dist").shift(1, fill_value=0).over("feature")) * (pl.col("cum_bad_dist") + pl.col("cum_bad_dist").shift(1).over("feature").fill_null(0)) / 2
            ).alias("bin_auc_contrib")
         ])
         # 计算 IV, KS, AUC
@@ -1550,7 +1550,8 @@ class MarsOptimalBinner(MarsBinnerBase):
         n_bins: int = 10,
         min_n_bins: int = 1,
         min_bin_size: float = 0.02,
-        n_prebins: int = 20,
+        min_bin_n_event: int = 3,
+        n_prebins: int = 50,
         prebinning_method: Literal["quantile", "uniform", "cart"] = "cart",
         min_prebin_size: float = 0.01,
         monotonic_trend: Literal["ascending", "descending", "auto", "auto_asc_desc"] = "auto_asc_desc",
@@ -1581,6 +1582,10 @@ class MarsOptimalBinner(MarsBinnerBase):
             **最小箱占比约束**。
             指定每个分箱 (不含缺失值和特殊值箱)包含的样本量占总样本量的最小比例 (0.0 ~ 0.5)。
             例如 0.05 表示每箱至少包含 5% 的样本。
+        min_bin_n_event: int, default=5
+            **最小箱事件数约束**。
+            指定每个分箱 (不含缺失值和特殊值箱)包含的事件数 (正样本数) 的最小数量。
+            例如 5 表示每箱至少包含 5 个事件。
         n_prebins: int, default=50
             **预分箱数量** (Stage 1)。
             在调用求解器前, 先将连续变量离散化为多少个初始区间。
@@ -1637,6 +1642,7 @@ class MarsOptimalBinner(MarsBinnerBase):
        )
         self.min_n_bins = min_n_bins
         self.min_bin_size = min_bin_size
+        self.min_bin_n_event = min_bin_n_event
         self.n_prebins = n_prebins
         self.prebinning_method = prebinning_method
         
@@ -1844,15 +1850,13 @@ class MarsOptimalBinner(MarsBinnerBase):
                     max_n_bins=self.n_bins, 
                     time_limit=self.time_limit, 
                     min_bin_size=current_ratio,
+                    min_bin_n_event=self.min_bin_n_event,
                     verbose=False
                )
                 opt.fit(col_data, y_data)
                 
                 if opt.status in ["OPTIMAL", "FEASIBLE"]:
                     res_cuts = [float('-inf')] + list(opt.splits) + [float('inf')]
-                    # 防止优化过度
-                    if len(res_cuts) <= 2 and len(pre_cuts) > 2:
-                        return col, pre_cuts, "Solver collapsed to single bin; fallback to pre-bins"
                     return col, res_cuts, None
             
                 # 捕获求解器非最优状态 (如 TIMEOUT)
@@ -1984,6 +1988,18 @@ class MarsOptimalBinner(MarsBinnerBase):
             for c in cat_cols:
                 series = X.get_column(c)
                 col_dtype = series.dtype
+                
+                if self.cat_cutoff is not None:
+                    # 1. 极速计算 Value Counts
+                    # top_k 算子在 Polars 中有专门优化
+                    top_k_df = series.value_counts(sort=True).head(self.cat_cutoff)
+                    top_vals = top_k_df.get_column(c)
+                    
+                    # 2. 只有在 top_k 里的才保留，否则置为 Other
+                    # 注意: 这里使用 is_in (Hash Set) 过滤
+                    series = pl.when(series.is_in(top_vals))\
+                               .then(series)\
+                               .otherwise(pl.lit("__Mars_Other_Pre__"))
                 
                 # 获取该列的安全排除列表
                 safe_exclude = self._get_safe_values(col_dtype, raw_exclude)

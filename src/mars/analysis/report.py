@@ -1,13 +1,18 @@
 import polars as pl
 import pandas as pd
 import numpy as np
-from typing import Dict, Tuple, Optional, Union, List, Any
+from typing import Dict, Tuple, Optional, Union, List, Any, NamedTuple
 from mars.utils.logger import logger
 
 try:
     from IPython.display import display, HTML
 except ImportError:
     display = None
+    
+class ProfileData(NamedTuple):
+    overview: Union[pl.DataFrame, pd.DataFrame]
+    dq_trends: Dict[str, Union[pl.DataFrame, pd.DataFrame]]
+    stats_trends: Dict[str, Union[pl.DataFrame, pd.DataFrame]]
 
 class MarsProfileReport:
     """
@@ -34,95 +39,182 @@ class MarsProfileReport:
         dq_tables: Dict[str, Union[pl.DataFrame, pd.DataFrame]],
         stats_tables: Dict[str, Union[pl.DataFrame, pd.DataFrame]]
     ) -> None:
-        """
-        初始化报告容器。
-
-        Parameters
-        ----------
-        overview : Union[pl.DataFrame, pd.DataFrame]
-            全量概览表，包含特征名、类型、分布图及各类统计指标。
-        dq_tables : Dict[str, Union[pl.DataFrame, pd.DataFrame]]
-            数据质量 (DQ) 指标趋势表字典，包含缺失率、零值率等随分组维度的变化。
-        stats_tables : Dict[str, Union[pl.DataFrame, pd.DataFrame]]
-            统计指标趋势表字典，包含均值、标准差等随分组维度的变化。
-        """
-        self.overview_table: Union[pl.DataFrame, pd.DataFrame] = overview
-        self.dq_tables: Dict[str, Union[pl.DataFrame, pd.DataFrame]] = dq_tables
-        self.stats_tables: Dict[str, Union[pl.DataFrame, pd.DataFrame]] = stats_tables
-
-    def get_profile_data(self) -> Tuple[
-        Union[pl.DataFrame, pd.DataFrame], 
-        Dict[str, Union[pl.DataFrame, pd.DataFrame]], 
-        Dict[str, Union[pl.DataFrame, pd.DataFrame]]
-    ]:
-        """
-        [API] 获取纯净的原始数据对象。
+        self.overview_table = overview
+        self.dq_tables = dq_tables
+        self.stats_tables = stats_tables
         
-        用于后续的特征筛选 (Selector)、自定义分析或将数据传入其他系统。
+        # 建立索引：将所有指标名映射到对应的数据源类型 ('dq' 或 'stat')
+        # 这允许我们在 show_trend 中快速定位
+        self._metric_index: Dict[str, str] = {}
+        for k in self.dq_tables.keys():
+            self._metric_index[k] = "dq"
+        for k in self.stats_tables.keys():
+            self._metric_index[k] = "stat"
 
-        Returns
-        -------
-        overview_df : Union[pl.DataFrame, pd.DataFrame]
-            全量概览大宽表。
-        dq_tables_dict : Dict[str, Union[pl.DataFrame, pd.DataFrame]]
-            DQ 指标趋势字典。
-        stats_tables_dict : Dict[str, Union[pl.DataFrame, pd.DataFrame]]
-            统计指标趋势字典。
-        """
-        return self.overview_table, self.dq_tables, self.stats_tables
+    def get_profile_data(self) -> ProfileData:
+        """[API] 获取原始数据对象"""
+        return ProfileData(
+            overview=self.overview_table,
+            dq_trends=self.dq_tables,
+            stats_trends=self.stats_tables
+        )
 
     def _repr_html_(self) -> str:
         """
-        [Internal] Jupyter Notebook 的富文本展示接口。
-        
-        当在 Jupyter 环境中直接打印此对象时，生成一个交互式的 HTML 控制面板。
-
-        Returns
-        -------
-        str
-            包含概览统计信息和操作指南的 HTML 字符串。
+        [Internal] Jupyter Notebook 控制面板 
         """
-        df_ov: Union[pl.DataFrame, pd.DataFrame] = self.overview_table
+        df_ov = self.overview_table
+        n_feats = len(df_ov) if hasattr(df_ov, "__len__") else df_ov.height
         
-        # 统计特征总数
-        n_feats: int = len(df_ov) if hasattr(df_ov, "__len__") else df_ov.height
-        
-        # 推断分组数量
-        sample_dq: Optional[Union[pl.DataFrame, pd.DataFrame]] = self.dq_tables.get('missing')
-        n_groups: int = 0
-        if sample_dq is not None:
-            n_cols: int = len(sample_dq.columns)
-            # 减去固定列: feature, dtype, total
-            n_groups = max(0, n_cols - 3)
+        dq_keys = list(self.dq_tables.keys())
+        stat_keys = list(self.stats_tables.keys())
 
-        # 构建控制面板内容
-        lines: List[str] = []
-        lines.append('<code>.show_overview()</code> 👈 <b>Full Overview (Recommended)</b>')
+        # --- 样式定义 (Inline CSS for portability) ---
+        # 胶囊样式，用于包裹指标名
+        pill_style = (
+            "background-color: #e8f4f8; color: #2980b9; border: 1px solid #bce0eb; "
+            "padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 0.9em; margin-right: 4px;"
+        )
+        # 代码块样式
+        code_style = (
+            "background-color: #f0f0f0; padding: 2px 4px; border-radius: 3px; "
+            "font-family: monospace; color: #e74c3c; font-weight: bold;"
+        )
         
-        dq_keys: List[str] = list(self.dq_tables.keys())
-        dq_links: List[str] = [f"<code>.show_dq('{k}')</code>" for k in dq_keys]
-        lines.append(f'DQ Trends: {", ".join(dq_links)}')
-        
-        stats_keys: List[str] = list(self.stats_tables.keys())
-        if stats_keys:
-            stat_links: List[str] = [f"<code>.show_trend('{k}')</code>" for k in stats_keys]
-            lines.append(f'Stats Trends: {", ".join(stat_links)}')
-        
-        lines.append('<code>.write_excel()</code> Export formatted report')
-        lines.append('<code>.get_profile_data()</code> Get raw data for feature selection')
+        # --- 辅助函数：生成指标徽章列表 ---
+        def _fmt_pills(keys):
+            if not keys: return "<span style='color:#ccc'>None</span>"
+            # 为了防止指标太多撑爆屏幕，限制显示数量 (例如只显示前 20 个，后面加 ...)
+            display_keys = keys[:30] 
+            pills = "".join([f"<span style='{pill_style}'>'{k}'</span>" for k in display_keys])
+            if len(keys) > 30:
+                pills += f"<span style='color:#999; font-size:0.8em'> (+{len(keys)-30} more)</span>"
+            return pills
 
+        # --- 组装 HTML ---
         return f"""
-        <div style="border-left: 5px solid #2980b9; background-color: #f4f6f7; padding: 15px; border-radius: 0 5px 5px 0;">
-            <h3 style="margin:0 0 10px 0; color:#2c3e50;">📊 Mars Data Profile Report</h3>
-            <div style="display: flex; gap: 20px; margin-bottom: 10px; color: #555;">
-                <div><strong>🏷️ Features:</strong> {n_feats}</div>
-                <div><strong>📅 Groups:</strong> {n_groups}</div>
+        <div style="border: 1px solid #e0e0e0; border-left: 5px solid #2980b9; border-radius: 4px; background: white; max-width: 900px; font-family: 'Segoe UI', sans-serif;">
+            
+            <div style="padding: 12px 15px; background-color: #f8f9fa; border-bottom: 1px solid #e0e0e0; display: flex; justify-content: space-between; align-items: center;">
+                <div style="font-weight: bold; color: #2c3e50; font-size: 1.1em;">
+                    📊 Mars Data Profile
+                </div>
+                <div style="font-size: 0.85em; color: #7f8c8d;">
+                    <span style="margin-left: 15px;">🏷️ Features: <b>{n_feats}</b></span>
+                    <span style="margin-left: 15px;">🔍 DQ Metrics: <b>{len(dq_keys)}</b></span>
+                    <span style="margin-left: 15px;">📉 Stat Metrics: <b>{len(stat_keys)}</b></span>
+                </div>
             </div>
-            <div style="font-size:0.9em; line-height:1.8; color:#7f8c8d; border-top: 1px solid #e0e0e0; padding-top: 8px;">
-                { "<br>".join(lines) }
+
+            <div style="padding: 15px;">
+                
+                <div style="margin-bottom: 15px;">
+                    <div style="font-size: 0.8em; text-transform: uppercase; color: #95a5a6; font-weight: bold; margin-bottom: 5px;">Quick Actions</div>
+                    <div style="display: flex; gap: 20px; font-size: 0.95em;">
+                        <div>👉 <span style="{code_style}">.show_overview()</span> &nbsp;<span style="color:#555">View Full Report</span></div>
+                        <div>💾 <span style="{code_style}">.write_excel()</span> &nbsp;<span style="color:#555">Export XLSX</span></div>
+                        <div>📥 <span style="{code_style}">.get_profile_data()</span> &nbsp;<span style="color:#555">Get Raw Data</span></div>
+                    </div>
+                </div>
+
+                <div style="border-top: 1px dashed #e0e0e0; padding-top: 12px;">
+                    <div style="font-size: 0.8em; text-transform: uppercase; color: #95a5a6; font-weight: bold; margin-bottom: 8px;">
+                        Trend Analysis <span style="font-weight:normal; text-transform:none; color:#bbb">(Use <code>.show_trend('metric_name')</code>)</span>
+                    </div>
+                    
+                    <div style="display: flex; margin-bottom: 8px; align-items: baseline;">
+                        <div style="width: 80px; font-weight: bold; color: #27ae60; font-size: 0.9em;">DQ:</div>
+                        <div style="flex: 1; line-height: 1.6;">
+                            {_fmt_pills(dq_keys)}
+                        </div>
+                    </div>
+                    
+                    <div style="display: flex; align-items: baseline;">
+                        <div style="width: 80px; font-weight: bold; color: #2980b9; font-size: 0.9em;">Stats:</div>
+                        <div style="flex: 1; line-height: 1.6;">
+                            {_fmt_pills(stat_keys)}
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+            
+            <div style="padding: 6px 15px; background-color: #fff8e1; border-top: 1px solid #fae5b0; font-size: 0.8em; color: #d35400;">
+                💡 <b>Pro Tip:</b> Use <span style="{code_style}">.show_trend('psi')</span> to detect population stability drift.
             </div>
         </div>
         """
+
+    def show_overview(self) -> "pd.io.formats.style.Styler":
+        """展示全量概览大宽表"""
+        return self._get_styler(
+            self.overview_table, 
+            title="Dataset Overview", 
+            cmap="RdYlGn_r", 
+            # 指定哪些列应用“红绿灯”配色 (高值=红)
+            subset_cols=["missing_rate", "zeros_rate", "unique_rate", "top1_ratio"],
+            fmt_as_pct=False # 概览表混合了多种类型，不强制全转百分比，由内部逻辑细分
+        )
+
+    def show_trend(self, metric: str, ascending: bool = True) -> "pd.io.formats.style.Styler":
+        """
+        [统一接口] 展示指定指标的分组趋势。
+
+        该方法会自动根据指标类型（DQ 或 Stats）智能选择可视化模板：
+        - **DQ指标 (missing, etc.)**: 自动使用百分比格式 + 红绿灯配色 (RdYlGn_r)。
+        - **PSI**: 使用红绿灯配色 + 0.25 阈值锚定。
+        - **Stability (group_cv)**: 自动附加数据条。
+        - **常规统计 (mean, max)**: 使用蓝色热力图 (Blues)。
+
+        Parameters
+        ----------
+        metric : str
+            指标名称 (如 'missing', 'mean', 'psi')。
+        ascending : bool, default True
+            时间/分组列的排序方式。
+        """
+        # 1. 路由逻辑：查找指标属于哪个表
+        source_type = self._metric_index.get(metric)
+        if source_type is None:
+             # 提供更友好的报错提示
+            available = list(self._metric_index.keys())
+            raise ValueError(f"❌ Metric '{metric}' not found. Available metrics: {available[:10]}...")
+
+        # 2. 获取数据
+        if source_type == "dq":
+            df_raw = self.dq_tables[metric]
+            # DQ 默认配置
+            cmap = "RdYlGn_r"  # 红色代表高风险 (高缺失)
+            fmt_pct = True     # DQ 指标通常是率 (Rate/Ratio)
+            vmin, vmax = 0, 1  # 率通常在 0~1 之间
+            
+        else: # source_type == "stat"
+            df_raw = self.stats_tables[metric]
+            # Stats 默认配置
+            cmap = "Blues"     # 蓝色代表数值高低 (中性)
+            fmt_pct = False    # 统计值通常是绝对值
+            vmin, vmax = None, None
+
+        # 3. 特殊指标微调 (Override)
+        if metric == "psi":
+            cmap = "RdYlGn_r" # PSI 高了是坏事
+            fmt_pct = False   # PSI 是数值不是百分比
+            vmin, vmax = 0.0, 0.5 # 锚定阈值
+        
+        # 4. 转换与排序
+        df = self._to_pd(df_raw)
+        df = self._reorder_trend_cols(df, ascending)
+
+        # 5. 生成样式
+        return self._get_styler(
+            df,
+            title=f"Trend Analysis: {metric}",
+            cmap=cmap,
+            fmt_as_pct=fmt_pct,
+            vmin=vmin, 
+            vmax=vmax,
+            add_bars=True # 所有趋势表都允许显示 CV 条
+        )
 
     def _reorder_trend_cols(self, df: pd.DataFrame, ascending: bool) -> pd.DataFrame:
         """[Internal Helper] 重新排列趋势表的列顺序。"""
@@ -143,192 +235,111 @@ class MarsProfileReport:
                       [c for c in stat_cols if c in all_cols]
         return df[final_order]
 
-    def show_overview(self) -> "pd.io.formats.style.Styler":
-        """
-        展示全量概览大宽表。
-        
-        采用 'RdYlGn_r' (红-黄-绿 反转) 色系展示数据质量指标：
-        - 高缺失率/高单一值率 -> 红色 (警示风险)
-        - 低缺失率 -> 绿色 (健康状态)
-
-        Returns
-        -------
-        pd.io.formats.style.Styler
-            配置了热力图、迷你图样式和数值格式化的 Pandas Styler 对象。
-        """
-        return self._get_styler(
-            self.overview_table, 
-            title="Dataset Overview", 
-            cmap="RdYlGn_r", 
-            subset_cols=["missing_rate", "zeros_rate", "unique_rate", "top1_ratio"],
-            fmt_as_pct=False
-        )
-
-    def show_dq(self, metric: str, ascending: bool = True) -> "pd.io.formats.style.Styler":
-        """
-        展示指定数据质量 (DQ) 指标的趋势表。
-        
-        Parameters
-        ----------
-        metric : str
-            DQ 指标名称，可选：'missing', 'zeros', 'unique', 'top1'。
-        ascending : bool, default True
-            趋势表中时间/分组列的排序方式。
-
-        Returns
-        -------
-        pd.io.formats.style.Styler
-            针对百分比指标优化的 Pandas Styler 对象。
-
-        Raises
-        ------
-        ValueError
-            当输入的指标名称不在 dq_tables 中时抛出。
-        """
-        if metric not in self.dq_tables:
-            raise ValueError(f"Unknown DQ metric: {metric}")
-        
-        # 转换并排序
-        df = self._to_pd(self.dq_tables[metric])
-        df = self._reorder_trend_cols(df, ascending)
-        
-        return self._get_styler(
-            df, 
-            title=f"DQ Trends: {metric}", 
-            cmap="RdYlGn_r",
-            fmt_as_pct=True
-        )
-
-    def show_trend(self, metric: str, ascending: bool = True) -> "pd.io.formats.style.Styler":
-        """
-        展示指定统计指标的趋势表。
-        
-        针对稳定性指标 (group_cv) 会自动添加数据条 (Data Bars) 可视化。
-        [新增] 针对 PSI 指标，使用红绿灯色系 (Red-Yellow-Green) 警示风险。
-
-        Parameters
-        ----------
-        metric : str
-            统计指标名称，例如：'mean', 'std', 'max', 'p50' 等。
-        ascending : bool, default True
-            趋势表中时间/分组列的排序方式。
-
-        Returns
-        -------
-        pd.io.formats.style.Styler
-            包含稳定性数据条展示的 Pandas Styler 对象。
-
-        Raises
-        ------
-        ValueError
-            当输入的指标名称不在 stats_tables 中时抛出。
-        """
-        if metric not in self.stats_tables:
-            raise ValueError(f"Unknown stats metric: {metric}")
-        
-        # 转换并排序
-        df = self._to_pd(self.stats_tables[metric])
-        df = self._reorder_trend_cols(df, ascending)
-        
-        # [修改] 针对 PSI 的特殊可视化逻辑
-        cmap = "Blues"
-        vmin, vmax = None, None
-        
-        if metric == "psi":
-            # 使用红黄绿反转色系: 低(绿) -> 中(黄) -> 高(红)
-            cmap = "RdYlGn_r"
-            # [关键] 锚定 PSI 的绝对值范围，确保 0.25 以上呈现明显的红色
-            vmin = 0.0
-            vmax = 0.5 
-        
-        return self._get_styler(
-            df, 
-            title=f"Stats Trend: {metric}", 
-            cmap=cmap, 
-            add_bars=True,
-            fmt_as_pct=False,
-            vmin=vmin,
-            vmax=vmax
-        )
-
     def write_excel(self, path: str = "mars_report.xlsx", ascending: bool = True) -> None:
-        """
-        将分析结果完整导出为带视觉格式的 Excel 文件。
         
-        导出内容包括：
-        1. Overview (概览页): 包含特征分布热力图。
-        2. DQ_{Metric} (质量趋势页): 包含缺失率等趋势。
-        3. Trend_{Metric} (分布趋势页): 包含稳定性分析及数据条展示。
-
-        Excel 特性：
-        - 百分比数字格式。
-        - 自动列宽适配。
-        - 冻结表头样式。
-
-        Parameters
-        ----------
-        path : str, default "mars_report.xlsx"
-            导出文件的目标路径。
-        ascending : bool, default True
-            趋势表中时间列的排序方式。True 为时间早的在前。
-        """
         logger.info(f"📊 Exporting report to: {path}...")
+        
+        # 1. 依赖检查
+        try:
+            import xlsxwriter
+        except ImportError:
+            logger.error("❌ 'xlsxwriter' is required for Excel export. Install it via: pip install xlsxwriter")
+            return
+
         try:
             with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
-                # 1. 导出概览页
+                # -----------------------------------------------------------
+                # 1. 导出概览页 (Overview)
+                # -----------------------------------------------------------
                 overview_styler = self.show_overview()
                 if overview_styler is not None:
                     overview_styler.to_excel(writer, sheet_name="Overview", index=False)
                 
-                # 2. 导出 DQ 指标页
-                for name in self.dq_tables:
-                    dq_styler = self.show_dq(name, ascending=ascending)
-                    if dq_styler is not None:
-                        dq_styler.to_excel(writer, sheet_name=f"DQ_{name}", index=False)
+                # -----------------------------------------------------------
+                # 2. 统一导出所有趋势页 (Trend & DQ)
+                # -----------------------------------------------------------
+                # 将 DQ 和 Stats 的 key 合并处理
+                dq_keys = list(self.dq_tables.keys())
+                stat_keys = list(self.stats_tables.keys())
+                all_metrics = dq_keys + stat_keys
                 
-                # 3. 导出统计指标页 (特别处理 Data Bars 和 PSI Colors)
-                for name in self.stats_tables:
-                    trend_styler = self.show_trend(name, ascending=ascending)
-                    if trend_styler is not None:
-                        sheet_name: str = f"Trend_{name.capitalize()}"
-                        trend_styler.to_excel(writer, sheet_name=sheet_name, index=False)
+                for metric in all_metrics:
+                    # [关键修复] 全部统一调用 show_trend
+                    styler = self.show_trend(metric, ascending=ascending)
+                    
+                    if styler is not None:
+                        # 动态决定 Sheet 前缀
+                        prefix = "DQ" if metric in self.dq_tables else "Trend"
+                        # 生成安全名称 (截断到31字符)
+                        sheet_name = f"{prefix}_{metric.capitalize()}"[:31]
                         
-                        df_pd: pd.DataFrame = self._reorder_trend_cols(self._to_pd(self.stats_tables[name]), ascending)
-                        worksheet = writer.sheets[sheet_name]
+                        styler.to_excel(writer, sheet_name=sheet_name, index=False)
                         
-                        # [新增] 针对 PSI 的 Excel 条件格式 (3色阶)
-                        if name == "psi":
-                            # 识别数值列范围 (排除 feature, dtype)
-                            meta_len = len([c for c in ["feature", "dtype"] if c in df_pd.columns])
-                            start_col_idx = meta_len
-                            # 排除最后的统计列
-                            end_col_idx = len(df_pd.columns) - 1
-                            
-                            worksheet.conditional_format(1, start_col_idx, len(df_pd), end_col_idx, {
-                                'type': '3_color_scale',
-                                'min_type': 'num', 'min_value': 0,    'min_color': '#63BE7B',
-                                'mid_type': 'num', 'mid_value': 0.1,  'mid_color': '#FFEB84',
-                                'max_type': 'num', 'max_value': 0.25, 'max_color': '#F8696B'
-                            })
+                        # 应用条件格式 (PSI 颜色 / Data Bars)
+                        # 为了避免 write_excel 太长，我们将逻辑抽离到辅助函数
+                        self._apply_excel_formatting(writer, sheet_name, metric, ascending)
 
-                        # 导出 Data Bars
-                        if "group_cv" in df_pd.columns:
-                            col_idx: int = df_pd.columns.get_loc("group_cv")
-                            worksheet.conditional_format(1, col_idx, len(df_pd), col_idx, {
-                                'type': 'data_bar', 
-                                'bar_color': '#FF9999', 
-                                'bar_solid': True,
-                                'min_type': 'num', 'min_value': 0, 
-                                'max_type': 'num', 'max_value': 1
-                            })
-                            
-                # 4. 自动列宽调整
+                # 3. 自动列宽调整
                 for sheet in writer.sheets.values():
                     sheet.autofit()
                     
             logger.info("✅ Report exported successfully.")
+
         except Exception as e:
-            logger.error(f"❌ Failed to export Excel: {e}")
+            logger.error(f"❌ Failed to export Excel: {e}", exc_info=True)
+
+    def _apply_excel_formatting(self, writer, sheet_name: str, metric: str, ascending: bool):
+        """
+        [Helper] 抽离 Excel 条件格式逻辑，保持主流程清晰。
+        """
+        # 我们需要获取底层的 DataFrame 来确定列索引位置
+        # 注意：需要重新获取对应的数据表并排序，以匹配 Excel 中的列顺序
+        if metric in self.dq_tables:
+            raw_df = self.dq_tables[metric]
+        else:
+            raw_df = self.stats_tables[metric]
+            
+        # 转换为 Pandas 并重排，确保与 Excel 内容一致
+        df_pd = self._reorder_trend_cols(self._to_pd(raw_df), ascending)
+        
+        worksheet = writer.sheets[sheet_name]
+        
+        # 1. PSI 专用三色阶 (红绿灯)
+        if metric == "psi":
+            # 识别中间的数据列范围 (排除 feature, dtype 等元数据)
+            # 简单的定位策略：从第3列开始(feature, dtype, distribution...) 到 倒数第4列结束
+            # 更稳健的方法是排除掉已知的非数据列
+            meta_cols = ["feature", "dtype", "distribution", "top1_value"]
+            # 找到第一个不是 meta_col 的列索引
+            start_col = 0
+            for i, col in enumerate(df_pd.columns):
+                if col not in meta_cols:
+                    start_col = i
+                    break
+            
+            # 排除末尾的聚合统计列
+            stat_cols = ["total", "group_mean", "group_var", "group_cv"]
+            end_col = len(df_pd.columns) - 1
+            # 这里的逻辑：只对中间的分组列应用红绿灯
+            # 如果你想对 total 列也应用，可以调整 end_col
+            
+            worksheet.conditional_format(1, start_col, len(df_pd), end_col, {
+                'type': '3_color_scale',
+                'min_type': 'num', 'min_value': 0.05, 'min_color': '#63BE7B', # Green
+                'mid_type': 'num', 'mid_value': 0.15, 'mid_color': '#FFEB84', # Yellow
+                'max_type': 'num', 'max_value': 0.25, 'max_color': '#F8696B'  # Red
+            })
+
+        # 2. 稳定性 Data Bars (针对 group_cv)
+        if "group_cv" in df_pd.columns:
+            col_idx = df_pd.columns.get_loc("group_cv")
+            worksheet.conditional_format(1, col_idx, len(df_pd), col_idx, {
+                'type': 'data_bar', 
+                'bar_color': '#638EC6', 
+                'bar_solid': True,
+                'min_type': 'num', 'min_value': 0, 
+                'max_type': 'num', 'max_value': 1
+            })
 
     def _to_pd(self, df: Any) -> pd.DataFrame:
         """
@@ -416,8 +427,10 @@ class MarsProfileReport:
         if "distribution" in df.columns:
             styler = styler.set_table_styles([
                 {'selector': '.col_distribution', 'props': [
-                    ('font-family', 'monospace'), 
+                    # 优先使用 Consolas (Win) 或 Menlo (Mac)，最后 fallback 到 monospace
+                    ('font-family', '"Consolas", "Menlo", "Courier New", monospace'), 
                     ('color', '#1f77b4'),
+                    ('white-space', 'pre'), # [关键] 防止 HTML 自动压缩连续空格
                     ('font-weight', 'bold'),
                     ('text-align', 'left')
                 ]}
@@ -526,7 +539,9 @@ class MarsEvaluationReport:
         return df
 
     def _repr_html_(self) -> str:
-        """Jupyter Notebook 仪表盘视图"""
+        """
+        [Dashboard] Jupyter Notebook 控制面板。
+        """
         # 内部展示逻辑统一转为 Pandas 处理
         df_summary_pd = self._to_pd(self.summary_table)
         n_feats = len(df_summary_pd)
@@ -536,22 +551,37 @@ class MarsEvaluationReport:
         if "PSI_max" in df_summary_pd.columns:
             high_risk_psi = sum(df_summary_pd["PSI_max"] > 0.25)
 
-        lines = []
-        lines.append('<code>.show_summary()</code> 👈 <b>Feature Ranking (PSI/AUC)</b>')
+        # 样式定义
+        pill_style = (
+            "background-color: #e8f4f8; color: #2980b9; border: 1px solid #bce0eb; "
+            "padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 0.9em; margin-right: 4px;"
+        )
         
-        # 动态生成链接
-        trend_links = [f"<code>.show_trend('{k}')</code>" for k in self.trend_tables.keys()]
-        lines.append(f'Trend Heatmaps: {", ".join(trend_links)}')
-        lines.append('<code>.write_excel()</code> Export monitoring report')
+        # 动态生成 Trend 链接
+        trend_keys = list(self.trend_tables.keys())
+        trend_pills = "".join([f"<span style='{pill_style}'>'{k}'</span>" for k in trend_keys])
+
+        lines = []
+        # 查看类操作
+        lines.append('👉 <code>.show_summary()</code> &nbsp;<span style="color:#7f8c8d">View Feature Ranking</span>')
+        lines.append(f'👉 <code>.show_trend(metric)</code> <span style="color:#7f8c8d">metric: {trend_pills}</span>')
+        
+        # [新增] 获取数据类操作
+        lines.append('<hr style="margin: 8px 0; border: 0; border-top: 1px dashed #ccc;">')
+        lines.append('📥 <code>.get_evaluation_data()</code> &nbsp;<span style="color:#7f8c8d">Get Raw Data (summary, trends, detail)</span>')
+        lines.append('💾 <code>.write_excel()</code> &nbsp;<span style="color:#7f8c8d">Export to Excel</span>')
 
         return f"""
-        <div style="border-left: 5px solid #8e44ad; background-color: #f4f6f7; padding: 15px; border-radius: 0 5px 5px 0;">
+        <div style="border-left: 5px solid #8e44ad; background-color: #f4f6f7; padding: 15px; border-radius: 0 5px 5px 0; font-family: 'Segoe UI', sans-serif;">
             <h3 style="margin:0 0 10px 0; color:#2c3e50;">📉 Mars Feature Evaluation</h3>
-            <div style="display: flex; gap: 30px; margin-bottom: 10px; color: #555;">
+            
+            <div style="display: flex; gap: 30px; margin-bottom: 12px; font-size: 0.95em;">
                 <div><strong>🏷️ Features:</strong> {n_feats}</div>
-                <div><strong>🚨 High PSI (>0.25):</strong> <span style="color: {'red' if high_risk_psi > 0 else 'green'}">{high_risk_psi}</span></div>
+                <div><strong>🚨 High PSI (>0.25):</strong> <span style="color: {'red' if high_risk_psi > 0 else 'green'}; font-weight:bold;">{high_risk_psi}</span></div>
+                <div><strong>📅 Group By:</strong> {self.group_col if self.group_col else 'None (Total Only)'}</div>
             </div>
-            <div style="font-size:0.9em; line-height:1.8; color:#7f8c8d; border-top: 1px solid #e0e0e0; padding-top: 8px;">
+            
+            <div style="font-size:0.9em; line-height:1.8; color:#2c3e50; background: white; padding: 10px; border: 1px solid #e0e0e0; border-radius: 4px;">
                 { "<br>".join(lines) }
             </div>
         </div>

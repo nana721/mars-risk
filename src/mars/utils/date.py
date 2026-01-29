@@ -43,10 +43,11 @@ class MarsDate:
         
         优化策略
         --------
-        1. **强制转 String**: 优先将输入转换为 ``pl.Utf8``。这解决了整数日期 (如 20250101) 
-           直接转 Date 时被 Polars 误读为 "Unix Timestamp (天数)" 从而变成 5万年以后的 bug。
-        2. **多格式尝试**: 依次尝试解析 '%Y%m%d', '%Y-%m-%d', '%Y/%m/%d', '%Y.%m.%d'。
-        3. **兜底机制**: 最后保留原始 Cast 逻辑，以兼容已经是 Date 类型的数据。
+        1. **类型优先保护**: 优先尝试直接 Cast。如果输入已经是 Date/Datetime，
+           则跳过后续字符串解析，大幅提升处理规整数据时的性能。
+        2. **强制转 String**: 对于无法直接 Cast 的类型，转换为 ``pl.Utf8`` 统一处理。
+           这解决了整数日期 (如 20250101) 被误读为天数偏移的 bug。
+        3. **多格式尝试**: 依次尝试解析常用的 ISO 格式、紧凑格式、斜杠和点号格式。
 
         Parameters
         ----------
@@ -60,29 +61,28 @@ class MarsDate:
         """
         expr = MarsDate._to_expr(col)
         
-        # 1. 强制转为 String 以统一处理 
-        #    (解决了 Int 20250101 被误读为 "5万年以后" 的 Bug)
+        # 预生成 String 表达式用于多格式解析尝试
         str_expr = expr.cast(pl.Utf8)
 
-        # 2. Coalesce: 从上到下尝试，返回第一个非 Null 的结果
+        # Coalesce: 从上到下尝试，返回第一个非 Null 的结果
         return pl.coalesce([
-            # A. 紧凑格式 (20250101) - 包含 Int 类型转为 Str 后的情况
+            # A. [优先] 尝试直接 Cast
+            # 如果是原生 Date/Datetime 或标准 "YYYY-MM-DD" 字符串，此步最高效
+            expr.cast(pl.Date, strict=False),
+            
+            # B. 标准 ISO 格式 (2025-01-01) 
+            # 强化匹配：部分特殊 Object 转 Str 后可能符合此格式
+            str_expr.str.to_date("%Y-%m-%d", strict=False),
+
+            # C. 紧凑格式 (20250101) 
+            # 解决 Int 类型转为 Str 后的情况（风控数仓常见格式）
             str_expr.str.to_date("%Y%m%d", strict=False),
             
-            # B. 标准 ISO 格式 (2025-01-01) - 包含原生的 Date/Datetime 转为 Str 后的情况
-            str_expr.str.to_date("%Y-%m-%d", strict=False),
-            
-            # C. 斜杠格式 (2025/01/01)
+            # D. 斜杠格式 (2025/01/01)
             str_expr.str.to_date("%Y/%m/%d", strict=False),
             
-            # D. 点号格式 (2025.01.01)
+            # E. 点号格式 (2025.01.01)
             str_expr.str.to_date("%Y.%m.%d", strict=False),
-            
-            # E. [兜底] 尝试直接 Cast
-            #    如果输入本身已经是 pl.Date 或 pl.Datetime，上面的转 Str 解析也能成功，
-            #    但为了保险起见（或者处理某些带时区的特殊 Datetime），保留这个作为最后手段。
-            #    注意：Int 类型在步骤 A 就会命中返回，不会走到这一步，所以安全了。
-            expr.cast(pl.Date, strict=False),
         ])
 
     @staticmethod

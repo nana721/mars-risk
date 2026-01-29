@@ -40,7 +40,28 @@ class MarsBinEvaluator(MarsBaseEstimator):
         分箱器实例。如果未提供，evaluate 时会自动拟合。
     binner_kwargs : dict
         传递给自动分箱器的额外参数。
+        
+    Examples
+    --------
+    >>> import polars as pl
+    >>> from mars.analysis import MarsBinEvaluator
+
+    >>> # 1. 准备数据 (支持 Polars/Pandas)
+    >>> df = pl.read_parquet("credit_risk_data.parquet")
+    >>> target_col = "is_default"
+
+    >>> # 2. 初始化评估器
+    >>> evaluator = MarsBinEvaluator(target_col=target_col)
+
+    >>> # 3. [最简模式] 一键评估 + 绘图
+    >>> # 自动拟合分箱 -> 计算 IV/PSI -> 绘制 Top 10 特征趋势图
+    >>> report = evaluator.evaluate_and_plot(df)
+
+    >>> # 4. 查看结果
+    >>> print(report.summary_table.head())  # 查看审计汇总表
+    >>> report.write_excel("risk_report.xlsx") # 导出精美 Excel
     """
+    
 
     def __init__(
         self, 
@@ -77,7 +98,8 @@ class MarsBinEvaluator(MarsBaseEstimator):
         profile_by: Optional[str] = None,
         dt_col: Optional[str] = None,
         benchmark_df: Union[pl.DataFrame, pd.DataFrame, None] = None, # Modified: 支持 Pandas 输入
-        weights_col: Optional[str] = None 
+        weights_col: Optional[str] = None,
+        batch_size: int = 500
     ) -> "MarsEvaluationReport":
         """
         [Core] 执行特征评估的主入口。
@@ -93,12 +115,16 @@ class MarsBinEvaluator(MarsBaseEstimator):
         profile_by : str, optional
             分组维度名（如 'month', 'vintage'）。若提供，将生成基于该维度的 Trend 趋势报表。
         dt_col : str, optional
-            日期列名。配合 `profile_by='month'` 等参数实现自动日期截断聚合。
+            日期列名。
+            - 若配合 `profile_by='week'`，则按周聚合。
+            - **[默认]** 若提供了 `dt_col` 但未提供 `profile_by`，默认为 **'month'** (按月聚合)。
         benchmark_df : Union[pl.DataFrame, pd.DataFrame], optional
             外部基准数据集。用于计算 PSI 的 Expected 分布。支持 Pandas DataFrame。
             若为 None，默认使用 `df` 中时间/分组顺序最早的一组作为基准。
         weights_col : str, optional
             样本权重列名。若指定，所有指标（BadRate, AUC, PSI等）均基于加权值计算。
+        batch_size : int, default 500
+            批处理大小。用于控制内存消耗与计算速度的平衡。
 
         Returns
         -------
@@ -133,17 +159,33 @@ class MarsBinEvaluator(MarsBaseEstimator):
             c for c in working_df.columns if c not in exclude_cols
         ]
 
-        # [自动化] 拟合阶段：如果没有提供分箱器，现场初始化并训练一个
-        if self.binner is None and self.binner_kwargs is not None:
+        if self.binner is None:
+            # 1. 准备参数
+            # 确保 kwargs 是字典 (虽然 __init__ 中的 **kwargs 保证了它是 dict，但防御性编程总没错)
+            fit_kwargs = self.binner_kwargs if self.binner_kwargs is not None else {}
             
-            if self.bining_type == "native":
-                logger.info("⚙️ No binner provided. Fitting MarsNativeBinner internally...")
-                self.binner = MarsNativeBinner(features=target_features, **self.binner_kwargs)
-            elif self.bining_type == "opt":
-                logger.info("⚙️ No binner provided. Fitting MarsOptimalBinner internally...")
-                self.binner = MarsOptimalBinner(features=target_features, **self.binner_kwargs)
+            # 2. 定义工厂映射
+            binner_factory = {
+                "native": MarsNativeBinner,
+                "opt": MarsOptimalBinner
+            }
             
-            self.binner.fit(working_df, working_df.get_column(self.target_col))
+            # 3. 获取分箱器类
+            binner_cls = binner_factory.get(self.bining_type)
+            if binner_cls is None:
+                # 如果输入了未知的类型，回退到 native 并警告
+                logger.warning(f"⚠️ Unknown bining_type '{self.bining_type}'. Fallback to 'native'.")
+                binner_cls = MarsNativeBinner
+            
+            logger.info(f"⚙️ No binner provided. Auto-fitting {binner_cls.__name__} internally...")
+            
+            # 4. 实例化
+            self.binner = binner_cls(features=target_features, **fit_kwargs)
+            
+            # 5. 拟合
+            # 注意：MarsOptimalBinner 需要 y，且通常能处理 Polars Series
+            y_series = working_df.get_column(self.target_col)
+            self.binner.fit(working_df, y_series)
         
         # [Transform] 数据转换：将原始连续值/离散值映射为分箱索引 (Int16)
         # 映射后的列名为 {feat}_bin
@@ -158,7 +200,8 @@ class MarsBinEvaluator(MarsBaseEstimator):
         # 将宽表 unpivot 后聚合，得到最小粒度统计表 (Group, Feature, Bin, Count, Bad)
         logger.debug("📊 Step 1: Scanning raw data for stats (Single Pass Map)...")
         group_stats_raw = self._agg_basic_stats(
-            df_binned, group_col, target_features, self.target_col, weights_col
+            df_binned, group_col, target_features, self.target_col, weights_col,
+            batch_size=batch_size 
         )
         
         # 3. [Reduce Phase A] 补全 WOE 信息
@@ -228,13 +271,17 @@ class MarsBinEvaluator(MarsBaseEstimator):
         group_col: str,
         features: List[str],
         y_col: str,
-        weights_col: Optional[str]
+        weights_col: Optional[str],
+        batch_size: int = 500  # [新增] 接收批次参数
     ) -> pl.DataFrame:
         """
-        [Map Phase] 全量数据扫描与核心聚合。
+        [Map Phase] 全量数据扫描与核心聚合 (Batched Implementation)。
 
-        利用 Polars 的 Lazy 模式和 Streaming 机制，将 5000+ 列的宽表高效转换为长表。
-        这是整个流程中唯一一次对大数据集的 I/O 操作。
+        采用 "分批-流式-聚合" (Batch-Stream-Agg) 策略：
+        1. 将数千个特征切分为多个批次 (Chunk)。
+        2. 对每个批次构建独立的 Lazy Query Plan。
+        3. 利用 Streaming 引擎执行聚合，并立即释放中间结果。
+        4. 最后纵向合并 (Vertical Concat) 所有批次的统计结果。
 
         Parameters
         ----------
@@ -248,46 +295,90 @@ class MarsBinEvaluator(MarsBaseEstimator):
             目标变量列。
         weights_col : Optional[str]
             权重列。
+        batch_size : int
+            每次聚合处理的特征数量。
 
         Returns
         -------
         pl.DataFrame
             长表格式的统计汇总表，包含 [group_col, feature, bin_index, count, bad]。
         """
-        bin_cols = [f"{f}_bin" for f in features]
+        # 1. 构造理论上应该存在的 bin 列名
+        theoretical_bin_cols = [f"{f}_bin" for f in features]
         
-        # 动态构建聚合表达式，兼容加权和非加权计算
-        if weights_col:
-            agg_exprs = [
-                pl.col(weights_col).sum().alias("count"),                       # 加权总样本数
-                (pl.col(y_col) * pl.col(weights_col)).sum().alias("bad")         # 加权坏样本数
-            ]
-            cols_to_select = [group_col, y_col, weights_col] + bin_cols
-            index_cols = [group_col, y_col, weights_col]
-        else:
-            agg_exprs = [
-                pl.len().alias("count"),                                        # 样本总数
-                pl.col(y_col).sum().alias("bad")                                # 坏样本数
-            ]
-            cols_to_select = [group_col, y_col] + bin_cols
-            index_cols = [group_col, y_col]
+        # 2. [修复] 获取实际存在的列名
+        # 使用 set 运算极速过滤，防止传入了未被分箱的特征导致报错
+        existing_cols = set(df_binned.columns)
+        actual_bin_cols = [c for c in theoretical_bin_cols if c in existing_cols]
+        
+        # 记录丢失的列（方便调试）
+        missing_cols = set(theoretical_bin_cols) - set(actual_bin_cols)
+        if missing_cols:
+            logger.warning(f"⚠️ {len(missing_cols)} features were not binned and will be skipped in evaluation. Examples: {list(missing_cols)[:3]}")
+            
+        if not actual_bin_cols:
+            raise ValueError("❌ No valid binned columns found in dataframe. Check your binner fit results.")
 
-        # 核心 Pipeline：
-        # unpivot 将宽表折叠，streaming=True 保证在内存不足时能处理 TB 级数据。
-        return (
-            df_binned.lazy()
-            .select(cols_to_select)
-            .unpivot(
-                index=index_cols, 
-                on=bin_cols, 
-                variable_name="feature_bin", 
-                value_name="bin_index"
+        # 使用实际存在的列进行后续操作
+        bin_cols = actual_bin_cols
+        
+        # 确定必须要保留的索引列 (Group, Target, Weight)
+        index_cols = [group_col, y_col]
+        if weights_col:
+            index_cols.append(weights_col)
+
+        # 预定义聚合表达式 (Lazy Expr)，避免在循环中重复构建
+        # 1. 统计样本数 (Count)
+        expr_count = pl.col(weights_col).sum() if weights_col else pl.len()
+        # 2. 统计坏样本数 (Bad)
+        expr_bad = (pl.col(y_col) * pl.col(weights_col)).sum() if weights_col else pl.col(y_col).sum()
+        
+        agg_exprs = [
+            expr_count.alias("count"),
+            expr_bad.alias("bad")
+        ]
+
+        result_frames: List[pl.DataFrame] = []
+        total_batches = (len(bin_cols) + batch_size - 1) // batch_size
+
+        # 核心循环：分批处理特征
+        for i in range(0, len(bin_cols), batch_size):
+            # 1. 切片：获取当前批次的特征列
+            batch_bins = bin_cols[i : i + batch_size]
+            
+            # 2. 选择：仅选取当前批次需要的列 + 索引列
+            cols_to_select = index_cols + batch_bins
+            
+            # 3. 构造查询计划 (Lazy Plan)
+            # 这里的 .lazy() 很关键，它允许 Polars 优化器仅针对当前切片进行内存规划
+            batch_res = (
+                df_binned.lazy()
+                .select(cols_to_select)
+                .unpivot(
+                    index=index_cols, 
+                    on=batch_bins, 
+                    variable_name="feature_bin", 
+                    value_name="bin_index"
+                )
+                # 还原原始特征名 (去除 _bin 后缀)
+                .with_columns(
+                    pl.col("feature_bin").str.replace("_bin", "").alias("feature")
+                )
+                # 聚合至最小粒度：(Group x Feature x Bin)
+                .group_by([group_col, "feature", "bin_index"])
+                .agg(agg_exprs)
+                # 执行并物化 (Streaming 模式防止大聚合 OOM)
+                .collect(streaming=True)
             )
-            .with_columns(pl.col("feature_bin").str.replace("_bin", "").alias("feature"))
-            .group_by([group_col, "feature", "bin_index"])
-            .agg(agg_exprs)
-            .collect(streaming=True)
-        )
+            
+            result_frames.append(batch_res)
+            # logger.debug(f"   ... Processed batch {i // batch_size + 1}/{total_batches}")
+
+        if not result_frames:
+            return pl.DataFrame()
+
+        # 4. 合并结果：将所有批次的小表 (Reduced Tables) 纵向合并
+        return pl.concat(result_frames)
 
     def _ensure_woe_info_optimized(self, group_stats_raw: pl.DataFrame):
         """
@@ -462,7 +553,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
             (pl.col("cum_bad_dist") - pl.col("cum_good_dist")).abs().alias("ks_bin"),
             
             # AUC 梯形法则计算面积
-            ((pl.col("cum_good_dist") - pl.col("cum_good_dist").shift(1).over([group_col, "feature"]).fill_null(0)) * (pl.col("cum_bad_dist") + pl.col("cum_bad_dist").shift(1).over([group_col, "feature"]).fill_null(0)) / 2
+            ((pl.col("cum_good_dist") - pl.col("cum_good_dist").shift(1, fill_value=0).over([group_col, "feature"])) * (pl.col("cum_bad_dist") + pl.col("cum_bad_dist").shift(1).over([group_col, "feature"]).fill_null(0)) / 2
             ).alias("auc_bin"),
 
             # IV 公式：(Good% - Bad%) * ln(Good%/Bad%)
@@ -471,8 +562,23 @@ class MarsBinEvaluator(MarsBaseEstimator):
 
         return sorted_df
 
-    def _prepare_context(self, df: pl.DataFrame, profile_by: str, dt_col: str) -> Tuple[pl.DataFrame, str]:
-        """[Helper] 内部辅助：处理日期截断逻辑。"""
+    def _prepare_context(self, df: pl.DataFrame, profile_by: Optional[str], dt_col: Optional[str]) -> Tuple[pl.DataFrame, str]:
+        """
+        [Helper] 上下文准备：处理日期截断逻辑与分组列兜底。
+        
+        策略优先级：
+        1. [智能默认] 若有 dt_col 但无 profile_by -> 默认按 'month' 聚合。
+        2. [自动聚合] 若有 dt_col 且 profile_by 为 day/week/month -> 执行日期截断生成新列。
+        3. [常规分组] 若有 profile_by -> 直接使用该列。
+        4. [兜底逻辑] 若啥都没 -> 生成 'Total' 常量列，视为单点评估。
+        """
+        
+        # 1. [智能默认] 有时间列没分组 -> 默认按月
+        if dt_col and not profile_by:
+            logger.info(f"ℹ️ `dt_col` provided ('{dt_col}') without `profile_by`. Defaulting trend to 'month'.")
+            profile_by = "month"
+
+        # 2. [自动聚合] 处理时间切片
         if dt_col and profile_by in ["day", "week", "month"]:
             if profile_by == "month":
                 date_expr = MarsDate.dt2month(dt_col)
@@ -482,9 +588,22 @@ class MarsBinEvaluator(MarsBaseEstimator):
                 date_expr = MarsDate.dt2day(dt_col)
             
             temp_group = f"_mars_auto_{profile_by}"
+            # 这里生成一个新的临时列作为分组列
             return df.with_columns(date_expr.alias(temp_group)), temp_group
         
-        return df, profile_by
+        # 3. [常规分组] 用户指定了现有的列 (比如 'city', 'channel')
+        if profile_by:
+            # 简单的校验，防止用户拼写错误
+            if profile_by not in df.columns:
+                # 此时可能是用户想按月分，但没传 dt_col，或者单纯写错了
+                # 为了不报错，这里还是 warn 一下比较好，或者让它在后续 unpivot 时报错
+                pass 
+            return df, profile_by
+
+        # 4. [兜底逻辑] 用户啥都没传 -> 视为单点评估 (Snapshot)
+        logger.info("ℹ️ No grouping specified. Evaluating as a single snapshot (Group='Total').")
+        fallback_col = "_mars_auto_total"
+        return df.with_columns(pl.lit("Total").alias(fallback_col)), fallback_col
 
     def _format_report(
         self, 
@@ -756,7 +875,6 @@ class MarsBinEvaluator(MarsBaseEstimator):
         if report is not None:
             # 此时 report.detail_table 可能是 Pandas 或 Polars，取决于之前的 evaluate
             # 为了保险起见，绘图前可以统一转回 Polars 处理，或者 MarsPlotter 支持 Pandas
-            # 假设 MarsPlotter 支持 Polars，我们这里确保一下
             target_df = report.detail_table
             target_group_col = report.group_col
         # 2. 尝试从 df_detail 提取数据
@@ -794,3 +912,261 @@ class MarsBinEvaluator(MarsBaseEstimator):
             ascending=ascending,
             dpi=dpi
         )
+        
+    def evaluate_and_plot(
+        self,
+        # --- 1. Evaluate 阶段核心参数 ---
+        df: Union[pl.DataFrame, pd.DataFrame],
+        features: Optional[List[str]] = None,
+        profile_by: Optional[str] = None,
+        dt_col: Optional[str] = None,
+        target_col: Optional[str] = None, 
+        benchmark_df: Union[pl.DataFrame, pd.DataFrame, None] = None,
+        weights_col: Optional[str] = None,
+        batch_size: int = 500,
+        
+        # --- 2. Binner 策略参数 ---
+        bining_type: Optional[Literal["native", "opt"]] = None, 
+        
+        # --- 3. Plot 阶段核心参数 ---
+        sort_by: str = "iv",       
+        ascending: bool = False,   
+        max_plots: int = 10,       
+        dpi: int = 120,
+        
+        # --- 4. Binner 临时透传参数 ---
+        **kwargs
+    ) -> "MarsEvaluationReport":
+        """
+        [One-Stop Shop] 一站式评估与绘图工作流 (Evaluation & Visualization Pipeline)。
+        
+        该方法封装了 "拟合 -> 转换 -> 评估 -> 绘图" 的完整闭环。它采用了 **上下文管理器 (Context Manager)** 的设计思想，
+        允许用户在不污染实例原始状态的前提下，临时覆盖参数进行快速实验。
+
+
+        Parameters
+        ----------
+        df : Union[pl.DataFrame, pd.DataFrame]
+            待评估的输入数据集 (Train/Test/OOT)。
+        features : List[str], optional
+            指定评估的特征列表。若为 None，自动识别所有可用特征。
+        profile_by : str, optional
+            趋势分析的分组列名 (如 'month', 'vintage')。
+            用于生成时间切片下的 Risk Trend 图表。
+        dt_col : str, optional
+            日期列名。
+            - 若配合 `profile_by='week'`，则按周聚合。
+            - **[智能默认]** 若提供了 `dt_col` 但未提供 `profile_by`，默认为 **'month'** (按月聚合)。
+        target_col : str, optional
+            **[临时覆盖]** 目标变量列名。
+            允许临时指定不同的 Label (如 'is_bad_7d' vs 'is_bad_30d') 进行评估，执行后会自动还原。
+        bining_type : {'native', 'opt'}, optional
+            **[临时覆盖]** 分箱算法策略。
+            - 'native': 极速原生分箱 (Quantile/Uniform)。
+            - 'opt': 最优分箱 (OptBinning)。
+            指定此参数将强制触发重新拟合 (Re-fit)。
+        max_plots : int, default 10
+            **[可视化熔断]**。
+            限制最终生成的图表数量。即使评估了 5000 个特征，也只绘制排序最靠前 (Top-N) 的 N 张图。
+            防止因渲染过多 Canvas 导致 Jupyter Notebook 卡死或内存溢出。
+        sort_by : str, default 'iv'
+            **[绘图筛选器]**。
+            决定绘制哪些特征的依据。支持 'iv', 'ks', 'auc', 'psi'。
+            配合 `ascending=False` (默认) 使用，优先展示“最重要”或“最不稳定”的特征。
+        ascending : bool, default False
+            排序方向。默认降序 (Descending)，即指标值大的排前面。
+        **kwargs : dict
+            **[分箱器透传参数]**。
+            直接传递给底层的 `MarsNativeBinner` 或 `MarsOptimalBinner`。
+            例如: `n_bins=10`, `min_bin_size=0.05`, `monotonic_trend='ascending'`。
+            注意: 传入任何 kwargs 都会触发分箱器的重新拟合。
+
+        Returns
+        -------
+        MarsEvaluationReport
+            包含汇总表 (Summary)、趋势表 (Trend) 和详情表 (Detail) 的报告容器对象。
+            
+        Examples
+        --------
+        **场景 1: 快速基线评估 (Quick Baseline)**
+        使用默认的 Native 分箱 (Quantile) 快速查看数据概貌。
+
+        >>> evaluator = MarsBinEvaluator(target_col="bad_0")
+        >>> report = evaluator.evaluate_and_plot(
+        ...     df=train_df,
+        ...     profile_by="month",   # 按月查看趋势
+        ...     dt_col="apply_date",
+        ...     max_plots=5           # 只画 IV 最高的前 5 个特征
+        ... )
+
+        **场景 2: 策略 A/B 测试 (精细化最优分箱)**
+        觉得原生分箱不够精细？切换到最优分箱 (OptBinning) 并注入严格的**风控业务约束**。
+        这里展示了如何通过 `kwargs` 透传参数来控制求解器行为。
+
+        >>> # 尝试: 最优分箱 + 强约束
+        >>> # bining_type="opt" 会自动触发重新拟合
+        >>> report_opt = evaluator.evaluate_and_plot(
+        ...     df, 
+        ...     profile_by="month",
+        ...     dt_col="apply_date",
+        ...     bining_type="opt",               # 1. 切换算法
+        ...     # --- 以下参数直接透传给 MarsOptimalBinner ---
+        ...     n_bins=10,                        # 最大分箱数
+        ...     min_bin_size=0.05,               # 最小箱占比 5% 
+        ...     min_bin_n_event=5,               #  每箱至少 5 个坏人
+        ...     prebinning_method="cart",        # 预分箱方法
+        ...     n_prebins=50,                     # 预分箱数
+        ...     min_prebin_size=0.01,            # 预分箱最小占比 1%
+        ...     monotonic_trend="auto_asc_desc", 
+        ...     time_limit=20                    # 单特征求解超时限制 (秒)
+        ... )
+
+        **场景 3: 不同 Label 的快速验证 (Label Shifting)**
+        无需重新实例化，直接测试不同的 Y (如 7天逾期 vs 30天逾期)。
+
+        >>> # 评估 7天逾期
+        >>> evaluator.evaluate_and_plot(df, target_col="is_bad_7d")
+        # -> 触发重置。根据 is_bad_7d 重新计算最优分箱切点，计算 IV。
+
+        >>> # 评估 30天逾期
+        >>> evaluator.evaluate_and_plot(df, target_col="is_bad_30d")
+        # -> 再次触发重置。根据 is_bad_30d 重新计算最优分箱切点，计算 IV。
+
+        **场景 4: 内存受限的大规模计算**
+        处理 5000+ 维宽表时，减小 batch_size 防止 OOM。
+
+        >>> evaluator.evaluate_and_plot(
+        ...     df_huge_wide, 
+        ...     batch_size=100,  # 降低 Map 阶段内存压力
+        ...     max_plots=20     # 只关注 Top 20 核心特征
+        ... )
+        """
+        
+        # ==============================================================================
+        # 0. Context Setup: 状态暂存与环境配置
+        # ==============================================================================
+        # 暂存原始状态，以便在 finally 块中还原，保证函数无副作用 (Side-effect free)
+        original_target = self.target_col
+        original_bining_type = self.bining_type 
+        original_binner_kwargs = self.binner_kwargs.copy() if self.binner_kwargs else {}
+        
+        # 1. 应用临时覆盖: Target
+        if target_col:
+            self.target_col = target_col
+            
+        # 2. 应用临时覆盖: Bining Type (算法策略)
+        if bining_type:
+            self.bining_type = bining_type
+
+        # 3. 处理动态参数 (kwargs) 与强制重置逻辑
+        #  增加 target_col 的判断
+        # 只要发生以下任一情况，都必须抛弃旧的分箱器，重新训练：
+        # 1. 传入了新的分箱参数 (kwargs)
+        # 2. 切换了算法类型 (bining_type)
+        # 3. 切换了目标变量 (target_col) -> 关键！因为最优分箱依赖 Y
+        should_reset_binner = (
+            (kwargs is not None and len(kwargs) > 0) or 
+            (bining_type is not None) or
+            (target_col is not None)  # <--- 新增这行
+        )
+
+        if kwargs:
+            if self.binner_kwargs is None: 
+                self.binner_kwargs = {}
+            self.binner_kwargs.update(kwargs)
+            
+        if should_reset_binner and self.binner is not None:
+            # 增加更详细的日志，告诉用户为什么重置了
+            reason = []
+            if kwargs: 
+                reason.append("params_changed")
+            if bining_type: 
+                reason.append("type_changed")
+            if target_col: 
+                reason.append("target_changed")
+            
+            logger.info(f"⚡ Context changed ({'+'.join(reason)}). Resetting binner to trigger auto-refit.")
+            self.binner = None
+
+        try:
+            # ==========================================================================
+            # 1. Execution: 执行核心评估计算
+            # ==========================================================================
+            # 调用底层 evaluate 方法，它会处理：
+            # - Auto-Fitting (如果 binner 为 None)
+            # - Transform (分箱映射)
+            # - Aggregation (Map-Reduce 计算指标)
+            report = self.evaluate(
+                df=df,
+                features=features,
+                profile_by=profile_by,
+                dt_col=dt_col,
+                benchmark_df=benchmark_df,
+                weights_col=weights_col,
+                batch_size=batch_size
+            )
+            
+            # ==========================================================================
+            # 2. Selection: 智能筛选绘图特征 (Top-N 逻辑)
+            # ==========================================================================
+            plot_features = features # 默认回退：全部特征
+            
+            # 获取 Summary 表用于排序
+            summary = report.summary_table
+            # 兼容性处理: 确保 summary 是 Polars DataFrame 以便使用高性能 sort
+            if isinstance(summary, pd.DataFrame):
+                summary_pl = pl.from_pandas(summary)
+            else:
+                summary_pl = summary
+            
+            # 映射简写指令到真实列名 (UX 优化)
+            sort_map = {
+                "iv": "IV_total", 
+                "ks": "KS_total", 
+                "auc": "AUC_total", 
+                "psi": "PSI_max" # 注意 PSI 通常看 Max 或 Avg
+            }
+            # get(key, default) -> 允许用户直接传 'IV_total' 这种原始列名
+            sort_key = sort_map.get(sort_by.lower(), sort_by)
+            
+            # 执行排序与截断
+            if sort_key in summary_pl.columns:
+                sorted_feats = (
+                    summary_pl
+                    .sort(sort_key, descending=not ascending)
+                    .get_column("feature")
+                    .to_list()
+                )
+                
+                # [熔断机制] 如果特征数超过 max_plots，仅绘制 Top N
+                if max_plots and max_plots > 0 and len(sorted_feats) > max_plots:
+                    logger.info(f"📉 [Visual Protection] Plotting Top {max_plots} features sorted by '{sort_key}' (out of {len(sorted_feats)}).")
+                    plot_features = sorted_feats[:max_plots]
+                else:
+                    plot_features = sorted_feats
+            else:
+                logger.warning(f"⚠️ Sort key '{sort_key}' not found in summary table. Plotting unsorted features.")
+
+            # ==========================================================================
+            # 3. Visualization: 批量绘图
+            # ==========================================================================
+            self.plot_feature_binning_risk_trends(
+                report=report,
+                features=plot_features, # 传入筛选后的列表
+                group_col=report.group_col,
+                sort_by=sort_by,
+                ascending=ascending,
+                dpi=dpi
+            )
+            
+            return report
+            
+        finally:
+            # ==========================================================================
+            # 4. Teardown: 状态还原
+            # ==========================================================================
+            # 无论执行成功与否，必须还原实例属性，防止本次临时参数污染后续调用
+            self.target_col = original_target
+            self.bining_type = original_bining_type
+            # [核心改进] 还原 kwargs，防止污染
+            self.binner_kwargs = original_binner_kwargs
