@@ -1639,6 +1639,10 @@ class MarsOptimalBinner(MarsBinnerBase):
         self.min_bin_size = min_bin_size
         self.n_prebins = n_prebins
         self.prebinning_method = prebinning_method
+        
+        if self.prebinning_method not in ["cart", "quantile", "uniform"]:
+            raise ValueError("prebinning_method must be one of {'cart', 'quantile', 'uniform'}")
+            
         self.min_prebin_size = min_prebin_size
         self.monotonic_trend = monotonic_trend
         self.solver = solver

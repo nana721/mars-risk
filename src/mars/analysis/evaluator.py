@@ -68,14 +68,15 @@ class MarsBinEvaluator(MarsBaseEstimator):
         self.binner = binner
         self.binner_kwargs = binner_kwargs
         self.bining_type = bining_type
+        
     @time_it
     def evaluate(
         self,
-        df: pl.DataFrame,
+        df: Union[pl.DataFrame, pd.DataFrame],  # Modified: 支持 Pandas 输入
         features: Optional[List[str]] = None,
         profile_by: Optional[str] = None,
         dt_col: Optional[str] = None,
-        benchmark_df: Optional[pl.DataFrame] = None,
+        benchmark_df: Union[pl.DataFrame, pd.DataFrame, None] = None, # Modified: 支持 Pandas 输入
         weights_col: Optional[str] = None 
     ) -> "MarsEvaluationReport":
         """
@@ -85,16 +86,16 @@ class MarsBinEvaluator(MarsBaseEstimator):
 
         Parameters
         ----------
-        df : pl.DataFrame
-            待评估的数据集（通常是训练集、测试集或 OOT 数据）。
+        df : Union[pl.DataFrame, pd.DataFrame]
+            待评估的数据集（通常是训练集、测试集或 OOT 数据）。支持 Pandas DataFrame。
         features : List[str], optional
             指定评估的特征列表。若为 None，自动识别除 Target/Group/Weight 外的所有列。
         profile_by : str, optional
             分组维度名（如 'month', 'vintage'）。若提供，将生成基于该维度的 Trend 趋势报表。
         dt_col : str, optional
             日期列名。配合 `profile_by='month'` 等参数实现自动日期截断聚合。
-        benchmark_df : pl.DataFrame, optional
-            外部基准数据集。用于计算 PSI 的 Expected 分布。
+        benchmark_df : Union[pl.DataFrame, pd.DataFrame], optional
+            外部基准数据集。用于计算 PSI 的 Expected 分布。支持 Pandas DataFrame。
             若为 None，默认使用 `df` 中时间/分组顺序最早的一组作为基准。
         weights_col : str, optional
             样本权重列名。若指定，所有指标（BadRate, AUC, PSI等）均基于加权值计算。
@@ -106,13 +107,23 @@ class MarsBinEvaluator(MarsBaseEstimator):
         """
         
         # --- 1. 上下文准备 (Context Setup) ---
+        
+        # [Pandas 兼容] 核心修改：利用父类方法统一转换为 Polars 并设置输出标志位
+        # 如果 df 是 Pandas，self._return_pandas 会被设为 True
+        working_df = self._ensure_polars_dataframe(df)
+        
+        # [Pandas 兼容] 同样处理 benchmark_df，但不需要改变 _return_pandas 状态（仅做计算用）
+        if benchmark_df is not None:
+            benchmark_df = self._ensure_polars_dataframe(benchmark_df)
+
         # 检查 Target 有效性，避免后续 AUC/KS 计算崩溃
-        n_unique = df.select(pl.col(self.target_col).n_unique()).item()
+        n_unique = working_df.select(pl.col(self.target_col).n_unique()).item()
         if n_unique < 2:
             logger.warning(f"⚠️ Target '{self.target_col}' has < 2 unique values. Metrics (AUC/KS) may be invalid.")
 
         # 处理日期聚合逻辑：将日期列转化为 '2023-01' 等格式
-        working_df, group_col = self._prepare_context(df, profile_by, dt_col)
+        # 注意：此处 working_df 已经是 Polars 格式，可以安全调用 Polars API
+        working_df, group_col = self._prepare_context(working_df, profile_by, dt_col)
         
         # 自动识别特征列：排除目标列、分组列和权重列
         exclude_cols = {self.target_col, group_col}
@@ -127,10 +138,10 @@ class MarsBinEvaluator(MarsBaseEstimator):
             
             if self.bining_type == "native":
                 logger.info("⚙️ No binner provided. Fitting MarsNativeBinner internally...")
-                self.binner = MarsNativeBinner(**self.binner_kwargs)
+                self.binner = MarsNativeBinner(features=target_features, **self.binner_kwargs)
             elif self.bining_type == "opt":
                 logger.info("⚙️ No binner provided. Fitting MarsOptimalBinner internally...")
-                self.binner = MarsOptimalBinner(**self.binner_kwargs)
+                self.binner = MarsOptimalBinner(features=target_features, **self.binner_kwargs)
             
             self.binner.fit(working_df, working_df.get_column(self.target_col))
         
@@ -203,6 +214,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
         )
 
         # 8. 格式化输出：重塑数据为最终 Report 容器
+        # 注意：_format_report 内部现在会调用 _format_output 来处理 Pandas 转换
         report = self._format_report(
             stats_long, metrics_groups, metrics_total, group_col, monotonicity_df
         )
@@ -506,6 +518,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
         -------
         MarsEvaluationReport
             报告容器实例。包含 Summary, Trend, Detail 三张重塑后的报表。
+            **[Pandas 兼容]**：如果 evaluate 输入为 Pandas，则返回的 Report 内部属性也会自动转为 Pandas。
 
         Notes
         -----
@@ -691,14 +704,23 @@ class MarsBinEvaluator(MarsBaseEstimator):
             # 排序列顺序，确保 Total 在最右
             cols = [c for c in pivot_df.columns if c not in ["feature", "dtype"]]
             sorted_cols = sorted([c for c in cols if c != "Total"]) + (["Total"] if "Total" in cols else [])
-            trend_tables[metric] = pivot_df.select(["feature", "dtype"] + sorted_cols)
+            
+            # [Pandas 兼容] 在这里对 dict 中的每个 df 进行输出格式化
+            trend_tables[metric] = self._format_output(pivot_df.select(["feature", "dtype"] + sorted_cols))
 
-        return MarsEvaluationReport(summary_df, trend_tables, detail_table, group_col=group_col)
+        # [Pandas 兼容] 利用 self._format_output 处理最终返回的 DataFrame
+        # MarsEvaluationReport 接收转换后的 Pandas DF 或 Polars DF
+        return MarsEvaluationReport(
+            summary_table=self._format_output(summary_df), 
+            trend_tables=trend_tables, 
+            detail_table=self._format_output(detail_table), 
+            group_col=group_col
+        )
     
     def plot_feature_binning_risk_trends(
         self,
         report: Optional["MarsEvaluationReport"] = None,
-        df_detail: Union[pl.DataFrame, pd.DataFrame, None] = None,
+        df_detail: Union[pl.DataFrame, pd.DataFrame, None] = None, # Modified: 支持 Pandas 输入
         features: Union[str, List[str], None] = None,
         group_col: Optional[str] = None, 
         sort_by: str = "iv",
@@ -714,8 +736,8 @@ class MarsBinEvaluator(MarsBaseEstimator):
         ----------
         report : MarsEvaluationReport, optional
             由 evaluate 生成的报告对象。
-        df_detail : pl.DataFrame or pd.DataFrame, optional
-            直接传入明细表（若未提供 report）。
+        df_detail : Union[pl.DataFrame, pd.DataFrame], optional
+            直接传入明细表（若未提供 report）。支持 Pandas DataFrame。
         features : str or List[str], optional
             要绘图的特征名。若为 None，绘制明细表中所有特征。
         group_col : str, optional
@@ -732,11 +754,20 @@ class MarsBinEvaluator(MarsBaseEstimator):
         
         # 1. 尝试从 Report 提取绘图所需数据
         if report is not None:
+            # 此时 report.detail_table 可能是 Pandas 或 Polars，取决于之前的 evaluate
+            # 为了保险起见，绘图前可以统一转回 Polars 处理，或者 MarsPlotter 支持 Pandas
+            # 假设 MarsPlotter 支持 Polars，我们这里确保一下
             target_df = report.detail_table
             target_group_col = report.group_col
         # 2. 尝试从 df_detail 提取数据
         elif df_detail is not None:
-            target_df = df_detail
+            # [Pandas 兼容] 如果传入的是 Pandas，先转为 Polars 方便后续处理
+            # 注意：这里不需要设置 _return_pandas，因为绘图不返回数据
+            if isinstance(df_detail, pd.DataFrame):
+                target_df = pl.from_pandas(df_detail)
+            else:
+                target_df = df_detail
+                
             if group_col:
                 target_group_col = group_col
             else:
