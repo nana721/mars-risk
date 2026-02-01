@@ -20,7 +20,6 @@ class MarsBaseEstimator(BaseEstimator):
     允许用户在管道中灵活控制输出格式（Pandas 或 Polars）。
     """
     
-    # Polars 的数值类型集合 (类属性，避免重复创建)
     _PL_NUMERIC_TYPES = {
         pl.Int8, pl.Int16, pl.Int32, pl.Int64, 
         pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64, 
@@ -38,7 +37,7 @@ class MarsBaseEstimator(BaseEstimator):
 
     def set_output(self, transform: Literal["default", "pandas", "polars"] = "default") -> "MarsBaseEstimator":
         """
-        兼容 Sklearn 的 set_output API，允许用户强制指定输出格式。
+        兼容 Sklearn 的 set_output API, 允许用户强制指定输出格式。
 
         Parameters
         ----------
@@ -57,7 +56,6 @@ class MarsBaseEstimator(BaseEstimator):
             
         self._output_config = transform
         
-        # 立即应用配置 (虽然主要逻辑在 _ensure_polars 中，但这里设置好状态是个好习惯)
         if transform == "pandas":
             self._return_pandas = True
         elif transform == "polars":
@@ -78,9 +76,12 @@ class MarsBaseEstimator(BaseEstimator):
         else: # default
             self._return_pandas = input_is_pandas
 
-    def _ensure_polars_dataframe(self, X: Any) -> Union[pl.DataFrame, pl.LazyFrame]:
+    def _ensure_polars_dataframe(
+        self, 
+        X: pl.DataFrame | pl.LazyFrame | pd.DataFrame
+    ) -> Union[pl.DataFrame, pl.LazyFrame]:
         """
-        [类型守卫] 确保输入数据转换为 Polars DataFrame/LazyFrame，并执行严格校验。
+        [类型守卫] 确保输入数据转换为 Polars DataFrame/LazyFrame, 并执行严格校验。
         同时根据输入类型设置默认的输出格式。
         """
         # Case 1: 已经是 Polars (Eager or Lazy)
@@ -88,7 +89,7 @@ class MarsBaseEstimator(BaseEstimator):
             self._determine_output_format(input_is_pandas=False)
             return X
 
-        # Case 2: 是 Pandas (重点修改区域)
+        # Case 2: 是 Pandas
         elif isinstance(X, pd.DataFrame):
             # 决定输出格式
             self._determine_output_format(input_is_pandas=True)
@@ -109,7 +110,11 @@ class MarsBaseEstimator(BaseEstimator):
         else:
             raise DataTypeError(f"Mars expects Polars/Pandas DataFrame, got {type(X)}")
         
-    def _ensure_polars_series(self, y: Any, name: str = "target") -> Optional[pl.Series]:
+    def _ensure_polars_series(
+        self, 
+        y: pl.Series | pd.Series | np.ndarray | list | None, 
+        name: str = "target"
+    ) -> Optional[pl.Series]:
         """[类型守卫] 确保标签 y 转换为 Polars Series。"""
         if y is None:
             return None
@@ -133,23 +138,14 @@ class MarsBaseEstimator(BaseEstimator):
 
     def _validate_conversion(self, df_pd: pd.DataFrame, df_pl: Union[pl.DataFrame, pl.LazyFrame]):
         """
-        [安全检查] 对比 Pandas 和 Polars 的 Schema，防止数值类型意外崩坏为字符串。
+        [安全检查] 对比 Pandas 和 Polars 的 Schema, 防止数值类型意外崩坏为字符串。
         """
-        # ------------------------------------------------------------------
-        # 1. 预处理：针对 LazyFrame 必须先取样，否则无法直接索引或分析数据内容
-        # ------------------------------------------------------------------
-        if isinstance(df_pl, pl.LazyFrame):
-            # 仅取前 100 行进行启发式校验，兼顾性能与安全
-            check_df = df_pl.head(100).collect()
-        else:
-            check_df = df_pl
-
-        # 获取 Polars Schema (字典格式，查询效率更高)
-        pl_schema = check_df.schema
+        # 预处理：直接获取 Schema (LazyFrame 支持直接读取元数据，无需 collect)
+        pl_schema = df_pl.schema
 
         # 定义需要跳过启发式检查的列名模式
         SKIP_PATTERNS = re.compile(
-            r".*(_id|_dt|_at|_ts|_date|_time|_on)$|"  # 后缀: user_id, created_at
+            r".*(_id|_uuid|_dt|_at|_ts|_date|_time|_on)$|"  # 后缀: user_id, created_at
             r"^(id_|date_|time_|ts_)|"                # 前缀: id_code
             r"^(id|dt|ts|year|month|day|hour|minute|second)$", # 精确匹配
             re.IGNORECASE
@@ -159,9 +155,7 @@ class MarsBaseEstimator(BaseEstimator):
             pd_dtype = df_pd[col].dtype
             pl_dtype = pl_schema.get(col)
             
-            # ------------------------------------------------------------------
             # 检查 1: 严格拦截 (Pandas 明确是数值 -> Polars 变成了非数值)
-            # ------------------------------------------------------------------
             is_pd_numeric = pd.api.types.is_numeric_dtype(pd_dtype)
             is_pl_numeric = pl_dtype in self._PL_NUMERIC_TYPES
             
@@ -175,19 +169,26 @@ class MarsBaseEstimator(BaseEstimator):
                     f"Check for mixed dtypes in your Pandas DataFrame."
                 )
 
-            # ------------------------------------------------------------------
             # 检查 2: 脏数据陷阱预警 (针对 Object -> Utf8 的启发式嗅探)
-            # ------------------------------------------------------------------
             if pd_dtype == "object" and pl_dtype == pl.Utf8:
                 
-                # --- 过滤逻辑 ---
                 # 如果命中了 ID 或 时间类的命名规则，直接跳过警告逻辑
                 if SKIP_PATTERNS.match(str(col)):
                     continue
-                # --------------------
 
-                # 获取样本数据进行探测
-                sample_series = check_df[col].drop_nulls().head(10)
+                # [优化] 获取样本数据进行探测：仅针对该列进行惰性计算
+                if isinstance(df_pl, pl.LazyFrame):
+                    # select 单列 -> drop_nulls -> limit -> collect -> to_series
+                    sample_series = (
+                        df_pl.select(pl.col(col))
+                        .drop_nulls()
+                        .head(10)
+                        .collect()
+                        .to_series()
+                    )
+                else:
+                    sample_series = df_pl[col].drop_nulls().head(10)
+
                 if sample_series.len() == 0:
                     continue
                 
@@ -196,8 +197,7 @@ class MarsBaseEstimator(BaseEstimator):
                 looks_like_numeric = True
                 try:
                     for s in samples:
-                        # 排除掉纯空格、空字符串或长 ID 类数字的干扰
-                        # 风控建议：ID 类通常较长，如果长度超过 15 位且是纯数字，通常不需要预警
+                        # 排除掉纯空格、空字符串或长 ID 类数字的干扰, 如果长度超过 15 位且是纯数字，不需要预警
                         s_str = str(s).strip()
                         if not s_str or (s_str.isdigit() and len(s_str) > 15):
                             looks_like_numeric = False
@@ -237,7 +237,7 @@ class MarsBaseEstimator(BaseEstimator):
         if not self._return_pandas:
             return data
 
-        # 递归处理字典 (见 stats_reports)
+        # 递归处理字典
         if isinstance(data, dict):
             return {k: self._format_output(v) for k, v in data.items()}
         
@@ -259,7 +259,7 @@ class MarsTransformer(MarsBaseEstimator, TransformerMixin, ABC):
     """
 
     def __init__(self):
-        super().__init__() # 初始化 _return_pandas
+        super().__init__() 
         self.feature_names_in_: List[str] = []
         self._is_fitted: bool = False
 
@@ -269,6 +269,7 @@ class MarsTransformer(MarsBaseEstimator, TransformerMixin, ABC):
     def get_feature_names_out(self, input_features=None) -> List[str]:
         return self.feature_names_in_
 
+    @time_it
     def fit(
         self, 
         X: pl.DataFrame | pd.DataFrame, 
@@ -279,7 +280,7 @@ class MarsTransformer(MarsBaseEstimator, TransformerMixin, ABC):
         # 检查 X 和 y 的索引一致性
         if isinstance(X, pd.DataFrame) and isinstance(y, pd.Series):
             if not X.index.equals(y.index):
-                logger.warn("X and y have different indices. Polars will align them by position.")
+                logger.warning("X and y have different indices. Polars will align them by position.")
                 
         X_pl = self._ensure_polars_dataframe(X)
         y_pl = self._ensure_polars_series(y)
@@ -290,7 +291,12 @@ class MarsTransformer(MarsBaseEstimator, TransformerMixin, ABC):
         self._is_fitted = True
         return self
 
-    def transform(self, X: Any, **kwargs) -> pl.DataFrame | pd.DataFrame | pl.LazyFrame:
+    @time_it
+    def transform(
+        self, 
+        X: pl.DataFrame | pl.LazyFrame | pd.DataFrame, 
+        **kwargs
+    ) -> pl.DataFrame | pd.DataFrame | pl.LazyFrame:
         """
         模板方法：Transform。
         

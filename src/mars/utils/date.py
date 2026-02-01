@@ -66,22 +66,22 @@ class MarsDate:
 
         # Coalesce: 从上到下尝试，返回第一个非 Null 的结果
         return pl.coalesce([
-            # A. [优先] 尝试直接 Cast
+            # 1. 尝试直接 Cast
             # 如果是原生 Date/Datetime 或标准 "YYYY-MM-DD" 字符串，此步最高效
             expr.cast(pl.Date, strict=False),
             
-            # B. 标准 ISO 格式 (2025-01-01) 
+            # 2. 标准 ISO 格式 (2025-01-01) 
             # 强化匹配：部分特殊 Object 转 Str 后可能符合此格式
             str_expr.str.to_date("%Y-%m-%d", strict=False),
 
-            # C. 紧凑格式 (20250101) 
-            # 解决 Int 类型转为 Str 后的情况（风控数仓常见格式）
+            # 3. 紧凑格式 (20250101) 
+            # 解决 Int 类型转为 Str 后的情况
             str_expr.str.to_date("%Y%m%d", strict=False),
             
-            # D. 斜杠格式 (2025/01/01)
+            # 4. 斜杠格式 (2025/01/01)
             str_expr.str.to_date("%Y/%m/%d", strict=False),
             
-            # E. 点号格式 (2025.01.01)
+            # 5. 点号格式 (2025.01.01)
             str_expr.str.to_date("%Y.%m.%d", strict=False),
         ])
 
@@ -147,7 +147,7 @@ class MarsDate:
     @staticmethod
     def format_dt(dt: Union[str, pl.Expr], fmt: str = "%Y-%m-%d") -> pl.Expr:
         """
-        [展示用] 将日期解析并格式化为指定字符串。
+        将日期解析并格式化为指定字符串。
 
         Parameters
         ----------

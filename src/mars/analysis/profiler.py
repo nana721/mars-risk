@@ -11,7 +11,7 @@ from mars.analysis.report import MarsProfileReport
 from mars.analysis.config import MarsProfileConfig
 from mars.feature.binner import MarsNativeBinner
 from mars.utils.logger import logger
-from mars.utils.decorators import time_it # , monitor_os_memory
+from mars.utils.decorators import time_it 
 from mars.utils.date import MarsDate
 
 class MarsDataProfiler(MarsBaseEstimator):
@@ -21,7 +21,7 @@ class MarsDataProfiler(MarsBaseEstimator):
     专为大规模风控建模数据集设计。它作为分析流程的入口，封装了从
     数据质量诊断、统计值计算到可视化生成的全链路逻辑。
 
-    主要功能 (Key Features)
+    主要功能
     -----------------------
     1. **全量指标概览 (Overview)**:
        - 计算 Missing/Zero/Unique/Top1 等基础 DQ 指标。
@@ -39,22 +39,23 @@ class MarsDataProfiler(MarsBaseEstimator):
     Attributes
     ----------
     df : pl.DataFrame
-        内部存储的 Polars DataFrame (已转换为 Polars 格式)。
+        内部存储的 Polars DataFrame。
     features : List[str]
-        最终确定的待分析特征列表 (经过 exclude_features 和 include_dtypes 筛选后)。
+        最终确定的待分析特征列表。
     config : MarsProfileConfig
         全局配置对象。控制计算哪些指标、是否画图等。
         详见 `mars.analysis.config.MarsProfileConfig`。
     custom_missing : List[Any]
-        自定义缺失值列表 (如 -999, 'null')。在计算 missing_rate 时计入分子，
-        在计算统计分布 (Mean/Std) 时被剔除。
+        自定义缺失值列表 (如 -999, 'null')。
+        - 在计算 missing_rate 时计入分子，
+        - 在计算统计分布 (Mean/Std) 时被剔除。
     special_values : List[Any]
-        自定义特殊值列表。这些值被视为有效值参与 DQ 统计 (如 Top1)，
+        自定义特殊值列表。这些值被视为有效值参与 DQ 统计 (如 Top1),
         但在计算数值分布 (Sparkline/Mean/PSI) 时会被剔除。
     psi_cv_ignore_threshold : float
         PSI 稳定性计算的门控阈值 (默认 0.05)。
         用于解决 "小基数陷阱"：若某特征在所有分组下的 PSI 最大值仍小于该阈值，
-        则认为其处于绝对稳定区，强制将 Group CV 置为 0，避免微小波动触发误报。
+        则认为其处于绝对稳定区，强制将 Group CV 置为 0, 避免微小波动触发误报。
 
     Examples
     --------
@@ -82,7 +83,7 @@ class MarsDataProfiler(MarsBaseEstimator):
         custom_missing_values: Optional[List[Union[int, float, str]]] = None,
         custom_special_values: Optional[List[Any]] = None,
         
-        overview_batch_size: int = 500,  # 新增：控制概览计算的批大小
+        overview_batch_size: int = 500,  
         
         psi_batch_size: int = 50, 
         psi_n_bins: int = 10,           
@@ -97,15 +98,15 @@ class MarsDataProfiler(MarsBaseEstimator):
         Parameters
         ----------
         df : Union[pl.DataFrame, pd.DataFrame]
-            输入数据集。会自动转换为 Polars 格式以利用其向量化计算优势。
+            输入数据集。会自动转换为 Polars 格式。
         features : List[str], optional
             指定要分析的列名列表。如果为 None，则分析所有列。
         exclude_features : List[str], optional
             [黑名单] 指定要排除的列名列表。
-            逻辑优先级: final_features = (features or all_cols) - exclude_features
+            - 逻辑优先级: final_features = (features or all_cols) - exclude_features
         include_dtypes : List[pl.DataType], optional
             [类型白名单] 仅包含指定数据类型的列进行分析。
-            支持 Python 原生类型和 Polars 类型。例如: [int, pl.Int64, pl.Float64] 只分析数值列。
+            - 支持 Python 原生类型和 Polars 类型。例如: [int, pl.Int64, pl.Float64] 只分析数值列。
         custom_missing_values : List[Union[int, float, str]], optional
             指定自定义缺失值列表。例如: [-999, "unknown", "\\N"]。
         custom_special_values : List[Any], optional
@@ -118,7 +119,7 @@ class MarsDataProfiler(MarsBaseEstimator):
             计算 PSI 时的分箱方法。支持 "quantile" 或 "uniform"。默认为 "quantile"。
         psi_cv_ignore_threshold : float, optional
             PSI 稳定性计算的门控阈值。默认 0.01。
-            当某特征的平均 PSI 小于该值时，强制将 group_cv 置为 0，避免"小基数陷阱"。
+            - 当某特征的平均 PSI 小于该值时，强制将 group_cv 置为 0，避免"小基数陷阱"。
         sample_frac : float, optional
             如果指定，则对输入数据进行随机采样，采样比例为该值 (0~1之间)。
             数据量非常大时可用以提升分析速度，但会牺牲一定精度。
@@ -127,7 +128,7 @@ class MarsDataProfiler(MarsBaseEstimator):
         
         """
         super().__init__()
-        # 1. 数据接入与采样
+        # 数据接入与采样
         self.df = self._ensure_polars_dataframe(df)
         if sample_frac is not None and 0 < sample_frac < 1.0:
             logger.warning(f"🎲 Data is sampled (frac={sample_frac}). Metrics are estimates.")
@@ -135,17 +136,17 @@ class MarsDataProfiler(MarsBaseEstimator):
 
         self.config = config if config else MarsProfileConfig()
         
-        # 2. 值处理配置
+        # 值处理配置
         self.custom_missing = custom_missing_values if custom_missing_values else []
         self.special_values = custom_special_values if custom_special_values else []
         
-        # 3. PSI 配置
+        # PSI 配置
         self.psi_batch_size = psi_batch_size
         self.psi_n_bins = psi_n_bins
         self.psi_bin_method = psi_bin_method
         self.psi_cv_ignore_threshold = psi_cv_ignore_threshold
 
-        # 4. 特征筛选逻辑 
+        # 特征筛选逻辑 
         # Step A: 初始范围
         candidates = features if features else self.df.columns
             
@@ -192,7 +193,7 @@ class MarsDataProfiler(MarsBaseEstimator):
                 candidates = matched_cols
                 
             except Exception as e:
-                logger.error(f"Type filtering failed: {e}")
+                logger.error(f"Type filtering failed: {e}. Falling back to basic filtering, only works for Polars dtypes.")
                 # 降级策略: 简单的包含判断 (仅对 Polars 类型有效)
                 candidates = [c for c in candidates if self.df.schema[c] in target_dtypes]
 
@@ -286,10 +287,7 @@ class MarsDataProfiler(MarsBaseEstimator):
         if config_overrides:
             run_config = dataclasses.replace(self.config, **config_overrides)
 
-        # ---------------------------------------------------------------------
-        # 2. 构建分析上下文 (Context Setup)
-        #    决定本次运行使用的数据集 (working_df) 和 分组列 (group_col)
-        # ---------------------------------------------------------------------
+        # 2. 构建分析上下文, 决定本次运行使用的数据集 (working_df) 和 分组列 (group_col)
         working_df = self.df
         group_col = profile_by
 
@@ -313,7 +311,7 @@ class MarsDataProfiler(MarsBaseEstimator):
             # 生成临时分组列名, 避免与现有列冲突
             temp_group_col = f"_mars_auto_{profile_by}"
             
-            # 生成包含临时列的 working_df (Zero-Copy 机制下开销很小)
+            # 生成包含临时列的 working_df (Zero-Copy)
             working_df = self.df.with_columns(date_expr.alias(temp_group_col))
             group_col = temp_group_col
             
@@ -386,14 +384,14 @@ class MarsDataProfiler(MarsBaseEstimator):
         """
         cols = self.features
         
-        # 1. 向量化计算所有基础指标 (One-Pass)
+        # 1. 向量化计算所有基础指标
         stats: pl.DataFrame = self._analyze_cols_vectorized(cols, config)
         
         # 2. 拼接 dtype 信息
         dtype_df: pl.DataFrame = self._get_feature_dtypes()
         stats = stats.join(dtype_df, on="feature", how="left")
         
-        # 3. [Feature] 计算迷你分布图 (Sparklines)
+        # 3. 计算迷你分布图 (Sparklines)
         if config.enable_sparkline:
             sparkline_df: pl.DataFrame = self._compute_all_sparklines(cols, config)
             if not sparkline_df.is_empty():
@@ -480,7 +478,7 @@ class MarsDataProfiler(MarsBaseEstimator):
                 for expr in base_exprs:
                     # 获取表达式的原始名称 (如 "mean", "missing_rate")
                     metric_name = expr.meta.output_name()
-                    # 关键步骤：使用 ::: 作为分隔符编码元数据，便于后续解析
+                    # 使用 ::: 作为分隔符编码元数据，便于后续解析
                     all_exprs.append(expr.alias(f"{col}:::{metric_name}"))
 
             # 3. 执行批次聚合 (计算 1 行结果)
@@ -505,7 +503,7 @@ class MarsDataProfiler(MarsBaseEstimator):
             )
             all_batches.append(batch_pivoted)
 
-        # 6. 垂直合并所有批次的结果集 (Horizontal Partitioning Concatenation)
+        # 6. 垂直合并所有批次的结果集
         pivoted = pl.concat(all_batches)
         
         # 7. 类型标准化：将指标列统一转为 Float64
@@ -518,22 +516,14 @@ class MarsDataProfiler(MarsBaseEstimator):
             ])
             
         return pivoted
-    
-    
 
     def _compute_all_sparklines(self, cols: List[str], config: MarsProfileConfig) -> pl.DataFrame:
         """
-        [Internal] 批量计算数值列的迷你分布图 (Polars Native V3 + 并行优化版)。
-
-        [优化]
-        1. **Single-Sample Strategy**: 改为单次整体采样，避免高维场景下数千次重复采样产生的 I/O 瓶颈。
-        2. **Thread-Level Parallelism**: 引入 ThreadPoolExecutor。由于 Polars 底层释放 GIL，
-        并行计算 5000+ 列的直方图可获得近乎线性的加速。
+        [Internal] 批量计算数值列的迷你分布图 。
 
         使用 Polars 原生 API (`series.hist`) 进行直方图统计，并映射为 Unicode 字符画。
-        相比 Numpy 方案，减少了数据拷贝，并在处理缺失值和边缘情况时更加鲁棒。
 
-        **分布图符号说明 (Visual Representation)**:
+        分布图符号说明 (Visual Representation)
         -----------------------------------------
         * **正常分布**: 使用 Unicode 方块字符表示频率高低 (如 ``_ ▂▅▇█``)。
         - **0 值**: 强制使用下划线 ``_`` 作为基准线，确保视觉占位。
@@ -570,11 +560,8 @@ class MarsDataProfiler(MarsBaseEstimator):
                 schema={"feature": pl.String, "distribution": pl.String}
             )
 
-        # 2. 采样 (Sampling) - [性能优化: 单次整体采样]
+        # 2. 采样 (Sampling)
         limit_n = config.sparkline_sample_size
-        
-        # 策略：先 Select 目标列 -> 执行单次全列采样
-        # 这样避免了在循环中反复调用 sample() 带来的内存洗牌开销
         df_subset = self.df.select(num_cols)
         if df_subset.height > limit_n:
             sample_df = df_subset.sample(n=limit_n, with_replacement=False)
@@ -585,7 +572,7 @@ class MarsDataProfiler(MarsBaseEstimator):
         bars = ['_', '\u2582', '\u2583', '\u2584', '\u2585', '\u2586', '\u2587', '\u2588']
         n_bins: int = config.sparkline_bins
 
-        # 3. 定义单列处理函数 (用于并行映射)
+        # 3. 单列处理函数 
         def _process_column(col: str) -> Dict[str, str]:
             dist_str: str = "-" 
             try:
@@ -633,8 +620,7 @@ class MarsDataProfiler(MarsBaseEstimator):
                 
             return {"feature": col, "distribution": dist_str}
 
-        # 4. [性能优化: 多核并发执行]
-        # pl.thread_pool_size() 会自动识别当前系统的逻辑核心数。
+        # 4. 多核并发执行
         with ThreadPoolExecutor(max_workers=pl.thread_pool_size()-1) as executor:
             results = list(executor.map(_process_column, num_cols))
 

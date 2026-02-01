@@ -219,7 +219,8 @@ class MarsPlotter:
             all_groups = groups
         
         n_panels = len(all_groups)
-        if n_panels == 0: return
+        if n_panels == 0: 
+            return
         
         total_width = MarsPlotter.UNIT_WIDTH * n_panels
         total_height = MarsPlotter.UNIT_HEIGHT + 0.7
@@ -289,7 +290,9 @@ class MarsPlotter:
             bads = df_g["bad_rate"]
             
             # --- A. 柱状图：展示样本分布 (灰色) ---
-            ax.bar(x, counts, color='grey', label='Count Dist', alpha=0.4)
+            # 仅在第一个子图添加 Label，防止 Legend 混乱
+            label_bar = 'Count Dist' if i == 0 else None
+            ax.bar(x, counts, color='grey', label=label_bar, alpha=0.4)
             ax.set_ylim(0, global_max_count * 1.3) 
             
             if i == 0:
@@ -374,7 +377,7 @@ class MarsPlotter:
             perf_text = f"IV: {iv_val:.2f},  KS: {ks_val:.1f},  AUC: {auc_val:.2f},"
             ax.text(0.602, 1.015, perf_text, transform=ax.transAxes, ha='right', va='bottom', fontsize=fs_title+0.85, color='black')
             ax.text(0.607, 1.015, f"  PSI: {psi_val:.2f},", transform=ax.transAxes, ha='left', va='bottom', fontsize=fs_title+0.85, color='red' if psi_val > 0.1 else 'black')
-            ax.text(0.82, 0.945, f" {rc_str}", transform=ax.transAxes, ha='left', va='bottom', fontsize=fs_title+0.25, color=rc_color)
+            ax.text(0.837, 0.945, f" {rc_str}", transform=ax.transAxes, ha='left', va='bottom', fontsize=fs_title+0.36, color=rc_color)
             ax.text(0.837, 1.015, f" Miss:{g_miss_str}", transform=ax.transAxes, ha='left', va='bottom', fontsize=fs_title+0.85, color='#555555')
 
             # 绘制整体平均坏率参考线

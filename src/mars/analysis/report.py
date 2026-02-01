@@ -302,6 +302,22 @@ class MarsProfileReport:
         # 转换为 Pandas 并重排，确保与 Excel 内容一致
         df_pd = self._reorder_trend_cols(self._to_pd(raw_df), ascending)
         
+        # [优化] 动态查找时间列的索引范围，不再依赖固定顺序假设
+        # 1. 识别所有时间列
+        meta_and_stat = set(["feature", "dtype", "distribution", "top1_value", "total", "group_mean", "group_var", "group_cv"])
+        time_cols = [c for c in df_pd.columns if c not in meta_and_stat]
+        
+        if not time_cols:
+            return
+
+        # 2. 获取这些列在 Excel 中的 Excel-style 索引 (0-based)
+        col_indices = [df_pd.columns.get_loc(c) for c in time_cols]
+        start_col = min(col_indices)
+        end_col = max(col_indices)
+        
+        # 确保时间列是连续的 (通常 _reorder_trend_cols 保证了这点，但双重检查无害)
+        # 如果不连续，conditional_format 可能需要分段写，这里假设是连续的区域
+        
         worksheet = writer.sheets[sheet_name]
         
         # 1. PSI 专用三色阶 (红绿灯)
