@@ -3,5 +3,6 @@ from .config import MarsProfileConfig
 
 __all__ = [
     "MarsDataProfiler",
-    "MarsProfileConfig"
+    "MarsProfileConfig",
+    "profile_risk"
 ]

@@ -1311,6 +1311,8 @@ class MarsBinEvaluator(MarsBaseEstimator):
         df_detail: Union[pl.DataFrame, pd.DataFrame, None] = None, # Modified: 支持 Pandas 输入
         features: Union[str, List[str], None] = None,
         group_col: Optional[str] = None, 
+        # [新增] 支持外部传入 Target 名称，用于多目标绘图时的标题显示
+        target_name: Optional[str] = None,
         sort_by: str = "iv",
         ascending: bool = False,
         dpi: int = 150
@@ -1330,6 +1332,9 @@ class MarsBinEvaluator(MarsBaseEstimator):
             要绘图的特征名。若为 None，绘制明细表中所有特征。
         group_col : str, optional
             分组列名。
+        target_name : str, optional
+            目标变量名称。用于图表标题显示。
+            若不提供，默认使用 self.target_col。
         sort_by : str, default "iv"
             特征展示的排序指标。
         ascending : bool, default False
@@ -1355,7 +1360,8 @@ class MarsBinEvaluator(MarsBaseEstimator):
                 target_group_col = group_col
             else:
                 # 自动推断分组列
-                known = {"feature", "bin_index", "bin_label", "count", "bad", "bad_rate", "lift", "psi_bin", "ks_bin", "auc_bin", "iv_bin", "total_count"}
+                # 排除已知列，剩下的通常就是分组列
+                known = {"feature", "bin_index", "bin_label", "count", "bad", "bad_rate", "lift", "psi_bin", "ks_bin", "auc_bin", "iv_bin", "total_count", "trend", "y"}
                 candidates = [c for c in target_df.columns if c not in known]
                 target_group_col = candidates[0] if candidates else "month"
                 logger.debug(f"ℹ️ Auto-inferred group_col: '{target_group_col}'")
@@ -1367,12 +1373,16 @@ class MarsBinEvaluator(MarsBaseEstimator):
         elif isinstance(features, str):
             features = [features]
             
+        # 确定最终显示的 Target Name
+        # 优先使用传入的 target_name (多目标循环时传入)，否则使用实例绑定的 target_col
+        final_target_name = target_name if target_name else self.target_col
+            
         # 调用 MarsPlotter 绘图组件进行渲染
         MarsPlotter.plot_feature_binning_risk_trend_batch(
             df_detail=target_df,
             features=features,
             group_col=target_group_col,
-            target_name=self.target_col,
+            target_name=final_target_name, # 透传参数
             sort_by=sort_by,
             ascending=ascending,
             dpi=dpi
@@ -1678,3 +1688,347 @@ class MarsBinEvaluator(MarsBaseEstimator):
             self.bining_type = original_bining_type
             # [核心改进] 还原 kwargs，防止污染
             self.binner_kwargs = original_binner_kwargs
+            
+
+def profile_risk(
+    # --- 数据输入 (Data Input) ---
+    df: Union[pl.DataFrame, pd.DataFrame],
+    target: Union[str, List[str]], 
+    features: Optional[List[str]] = None,
+    
+    # --- 评估上下文 (Evaluation Context) ---
+    profile_by: Optional[str] = None,
+    dt_col: Optional[str] = None,
+    benchmark_df: Optional[Union[pl.DataFrame, pd.DataFrame]] = None,
+    weights_col: Optional[str] = None,
+    
+    # --- 分箱策略参数 (Binning Strategy) ---
+    binning_type: Literal["native", "opt"] = "native",
+    n_bins: int = 5,
+    min_bin_size: float = 0.02,
+    monotonic_trend: str = "auto_asc_desc",
+    special_values: Optional[List[Any]] = None,
+    missing_values: Optional[List[Any]] = None,
+    binner_kwargs: Optional[Dict[str, Any]] = None,
+    
+    # --- 绘图控制 (Plotting Control) ---
+    plot: bool = True,
+    plot_target: Union[str, List[str], None] = None,
+    max_plots: int = 10,
+    sort_by: str = "iv",
+    ascending: bool = False,
+    dpi: int = 300,
+    
+    # --- 性能参数 (Performance) ---
+    n_jobs: int = -1,
+    batch_size: int = 500
+) -> MarsEvaluationReport:
+    """
+    [Mars Risk Profiler] 风险特征全景画像扫描。
+    
+    该函数提供一站式的特征评估服务，自动完成 "自动分箱 -> 指标计算 (IV/PSI/AUC) -> 趋势绘图" 全流程。
+    适用于快速评估特征的风险区分能力、跨期稳定性以及业务逻辑合理性。
+
+    支持 **多目标 (Multi-Target)** 评估模式：
+    - 当传入 `target` 为列表时 (e.g., `['bad_30d', 'bad_90d']`)。
+    - 首个 Target 作为 **主目标 (Primary Target)**，用于训练分箱规则 (Fit)。
+    - 其余 Target 作为 **副目标 (Secondary Targets)**，复用主目标的分箱规则进行统计 (Transform)。
+    - 最终生成包含所有 Target 表现的汇总报表，便于对比同一特征在不同定义下的表现。
+
+    Parameters
+    ----------
+    df : Union[pl.DataFrame, pd.DataFrame]
+        待评估的数据集 (Train/Test/OOT)。
+    target : Union[str, List[str]]
+        目标变量列名 (0/1)。
+        - 若为 `str`: 单目标模式。
+        - 若为 `List[str]`: 多目标模式。target[0] 为主目标，其余为副目标。
+    features : List[str], optional
+        指定评估特征白名单。若为 None，自动扫描除 Target/Weights 之外的所有可用特征。
+    
+    profile_by : str, optional
+        趋势分析的分组维度 (如 'month', 'vintage')。
+    dt_col : str, optional
+        日期列名。若提供且 `profile_by` 为时间粒度指令 ('day'/'week'/'month')，则自动生成聚合列。
+    benchmark_df : DataFrame, optional
+        PSI 计算的基准数据集。若不提供，默认以 `df` 中时间最早的分组作为基准。
+    weights_col : str, optional
+        样本权重列名。若提供，所有指标（IV/AUC/PSI）均基于加权计算。
+
+    binning_type : {'native', 'opt'}, default 'native'
+        分箱算法策略。
+        - `'native'`: 极速原生分箱 (Quantile/Uniform/CART)。
+        - `'opt'`: 最优分箱 (OptBinning)，支持单调性约束。
+    n_bins : int, default 5
+        最大分箱数。
+    min_bin_size : float, default 0.02
+        最小箱占比约束 (0.0 ~ 0.5)。
+    monotonic_trend : str, default 'auto_asc_desc'
+        单调性约束 (仅当 `binning_type='opt'` 时有效)。
+        可选值: 'ascending', 'descending', 'peak', 'valley', 'auto', 'auto_asc_desc'。
+    special_values : List[Any], optional
+        特殊值列表 (如 -999)。将强制独立成箱，不参与切分。
+    missing_values : List[Any], optional
+        自定义缺失值列表。默认仅识别 Null/NaN。
+    binner_kwargs : Dict, optional
+        透传给分箱器的其他高级参数。
+
+    plot : bool, default True
+        是否自动绘制特征趋势图。
+    plot_target : Union[str, List[str], None], optional
+        多目标模式下，指定需要绘图的 Target。
+        - None (默认) / 'all': 绘制所有 Target 的趋势图。
+        - 'primary': 仅绘制主目标。
+        - List: 指定绘制列表，如 `['bad_30d']`。
+    max_plots : int, default 10
+        [熔断机制] 最多绘制多少张图。根据 `sort_by` 排序取 Top N。
+    sort_by : str, default 'iv'
+        绘图排序依据。可选: `'iv'`, `'psi'`, `'auc'`, `'ks'`, `'risk_corr'`, `'rank'`。
+    ascending : bool, default False
+        排序方向。默认降序 (Descending)，即指标值高的排前面。
+    dpi : int, default 300
+        图像分辨率。
+
+    n_jobs : int, default -1
+        并行核心数。
+    batch_size : int, default 500
+        批处理大小。降低此值可减少内存峰值，适合处理超宽表。
+
+    Returns
+    -------
+    MarsEvaluationReport
+        评估报告对象。包含：
+        - `summary_table`: 特征级汇总表 (IV/AUC/PSI/Decision)。
+        - `detail_table`: 分箱级明细表 (Count/BadRate/Lift)。
+        - `trend_tables`: 指标趋势宽表字典 (仅包含主目标数据)。
+    """
+    
+    # --- 0. 参数标准化与模式识别 (Argument Sanitization) ---
+    target_list = [target] if isinstance(target, str) else target
+    if not target_list:
+        raise ValueError("Target cannot be empty.")
+    
+    primary_target = target_list[0]
+    is_multi_target = len(target_list) > 1
+    
+    # 1. 组装分箱参数 (Fit Params Assembly)
+    fit_params = {
+        "n_bins": n_bins,
+        "min_bin_size": min_bin_size,
+        "monotonic_trend": monotonic_trend,
+        "special_values": special_values,
+        "missing_values": missing_values,
+        "n_jobs": n_jobs
+    }
+    # 合并用户传递的额外参数 (如 time_limit, cat_cutoff)
+    if binner_kwargs:
+        fit_params.update(binner_kwargs)
+        
+    logger.info(f"🚀 Starting Risk Profiling [Primary Target: {primary_target} | Strategy: {binning_type.upper()}]")
+    
+    # --- 2. 核心：拟合主目标分箱器 (Fit Primary Binner) ---
+    # 我们先创建一个针对主 Target 的 Evaluator，让它去 Fit
+    primary_evaluator = MarsBinEvaluator(
+        target_col=primary_target,
+        bining_type=binning_type,
+        **fit_params
+    )
+    
+    logger.info(f"👉 Evaluating Primary Target: {primary_target}")
+    primary_report = primary_evaluator.evaluate(
+        df=df,
+        features=features,
+        profile_by=profile_by,
+        dt_col=dt_col,
+        benchmark_df=benchmark_df,
+        weights_col=weights_col,
+        batch_size=batch_size
+    )
+    
+    # [Fast Path] 如果只有单目标，无需合并，直接准备绘图
+    if not is_multi_target:
+        # 统一使用最后的绘图逻辑
+        final_report = primary_report
+        # 这里的 target_list 就是 [primary_target]
+    
+    else:
+        # --- 3. 多目标循环评估 (Loop for Secondary Targets) ---
+        logger.info(f"🔄 Multi-Target Mode: Extending evaluation to {len(target_list)-1} secondary targets...")
+        
+        # 获取已经训练好的分箱器 (Trained Binner)
+        trained_binner = primary_evaluator.binner
+        
+        # 定义辅助转换函数：确保所有 DataFrame 统一为 Polars 格式以便处理
+        def to_pl(d: Union[pl.DataFrame, pd.DataFrame]) -> pl.DataFrame:
+            return pl.from_pandas(d) if isinstance(d, pd.DataFrame) else d
+
+        # 处理主目标的表：添加 target_col 列以区分来源
+        p_summary = to_pl(primary_report.summary_table).with_columns(pl.lit(primary_target).alias("target_col"))
+        p_detail = to_pl(primary_report.detail_table)
+
+        all_details: List[pl.DataFrame] = [p_detail]
+        all_summaries: List[pl.DataFrame] = [p_summary]
+        
+        # 循环评估其余 Target
+        for sec_target in target_list[1:]:
+            logger.info(f"👉 Evaluating Secondary Target: {sec_target}")
+            
+            # 实例化一个新的 Evaluator，但传入**已训练好的 Binner**
+            # MarsBinEvaluator 会检测到 binner 非空，从而跳过 fit 阶段，直接 transform
+            sec_evaluator = MarsBinEvaluator(
+                target_col=sec_target,
+                binner=trained_binner # <--- 核心：复用分箱规则
+            )
+            
+            sec_report = sec_evaluator.evaluate(
+                df=df,
+                features=features,
+                profile_by=profile_by,
+                dt_col=dt_col,
+                benchmark_df=benchmark_df,
+                weights_col=weights_col,
+                batch_size=batch_size
+            )
+            
+            # 同样转换并标记副目标的表
+            s_detail = to_pl(sec_report.detail_table)
+            s_summary = to_pl(sec_report.summary_table).with_columns(pl.lit(sec_target).alias("target_col"))
+            
+            all_details.append(s_detail)
+            all_summaries.append(s_summary)
+
+        # --- 4. 结果合并 (Merge Results) ---
+        logger.info("∑ Merging multi-target reports...")
+        
+        # 纵向合并所有 Detail 表 (Detail 表本身已有 'y' 列区分 target，无需额外处理)
+        final_detail = pl.concat(all_details)
+        
+        # 纵向合并 Summary 表
+        final_summary = pl.concat(all_summaries)
+        
+        logger.info("ℹ️ Note: 'trend_tables' in the report contains data for Primary Target only.")
+        
+        final_report = MarsEvaluationReport(
+            summary_table=final_summary,
+            trend_tables=primary_report.trend_tables, # 仅保留主目标趋势
+            detail_table=final_detail,
+            group_col=primary_report.group_col
+        )
+
+    # --- 5. 智能绘图 (Visualization Dispatch) ---
+    if plot:
+        # 解析需要绘图的 Target 列表
+        targets_to_plot = []
+        if plot_target is None or plot_target == "all":
+            targets_to_plot = target_list
+        elif plot_target == "primary":
+            targets_to_plot = [primary_target]
+        elif isinstance(plot_target, str):
+            targets_to_plot = [plot_target]
+        elif isinstance(plot_target, list):
+            targets_to_plot = plot_target
+            
+        # 过滤无效 Target (不在计算列表中的)
+        targets_to_plot = [t for t in targets_to_plot if t in target_list]
+        
+        if not targets_to_plot:
+            logger.warning("⚠️ No valid targets specified for plotting.")
+        else:
+            logger.info(f"🎨 Plotting trends for targets: {targets_to_plot}")
+            _plot_report_helper(
+                evaluator=primary_evaluator, # 复用这个实例的 plot 方法即可
+                report=final_report,
+                target_list=targets_to_plot, # [关键] 传入要画的列表
+                sort_by=sort_by,
+                ascending=ascending,
+                max_plots=max_plots,
+                dpi=dpi
+            )
+            
+    return final_report
+
+def _plot_report_helper(
+    evaluator: MarsBinEvaluator, 
+    report: MarsEvaluationReport, 
+    target_list: List[str], 
+    sort_by: str, 
+    ascending: bool, 
+    max_plots: int, 
+    dpi: int
+) -> None:
+    """
+    [Internal Helper] 辅助绘图函数，处理多 Target 循环与 Top-N 筛选逻辑。
+    
+    参数
+    ----
+    evaluator : MarsBinEvaluator
+        用于调用底层 plot_feature_binning_risk_trends 方法的实例。
+    report : MarsEvaluationReport
+        包含汇总数据的报告对象。
+    target_list : List[str]
+        需要绘制的目标变量列表。
+    """
+    # 准备 Summary 表用于排序
+    summary_all = report.summary_table
+    if isinstance(summary_all, pd.DataFrame):
+        summary_all = pl.from_pandas(summary_all)
+        
+    # 准备 Detail 表用于绘图数据源
+    detail_all = report.detail_table
+    if isinstance(detail_all, pd.DataFrame):
+        detail_all = pl.from_pandas(detail_all)
+
+    # 映射排序简码到真实列名
+    sort_map = {
+        "iv": "IV_total", "psi": "PSI_max", "ks": "KS_total", 
+        "auc": "AUC_total", "rc": "RC_min", "rank": "Mars_Decision"
+    }
+    sort_key = sort_map.get(sort_by.lower(), "IV_total")
+
+    # --- 循环绘制每个 Target ---
+    for current_target in target_list:
+        logger.info(f"📈 [Plotting Target] {current_target} ...")
+        
+        # 1. 筛选当前 Target 的 Summary 数据（用于排序）
+        # 注意：不同 Target 下特征的 IV/AUC 是不一样的，所以 Top 特征可能不同
+        # 单目标模式下 summary 可能没有 target_col 列，需要兼容
+        if "target_col" in summary_all.columns:
+            curr_summary = summary_all.filter(pl.col("target_col") == current_target)
+        else:
+            curr_summary = summary_all
+        
+        plot_features = None
+        if sort_key in curr_summary.columns:
+            sorted_feats = curr_summary.sort(sort_key, descending=not ascending)["feature"].to_list()
+            
+            if len(sorted_feats) > max_plots:
+                logger.info(f"   📉 Top {max_plots} features by '{sort_key}'")
+                plot_features = sorted_feats[:max_plots]
+            else:
+                plot_features = sorted_feats
+        
+        # 2. 筛选当前 Target 的 Detail 数据（用于绘图）
+        # 利用 Evaluator 的 plot 方法支持传入 df_detail 的特性
+        # 这里的 filter("y") 是关键，我们在 Evaluator._format_report 里加了这一列
+        curr_detail = detail_all.filter(pl.col("y") == current_target)
+        
+        if curr_detail.is_empty():
+            logger.warning(f"   ⚠️ No detail data found for target '{current_target}'. Skipping.")
+            continue
+
+        # 3. 调用底层绘图
+        # 注意：这里我们手动传入 df_detail，从而绕过 report.detail_table (那是全量的)
+        evaluator.plot_feature_binning_risk_trends(
+            report=None, # 不传 report，使用 df_detail
+            df_detail=curr_detail, # 传筛选后的 detail
+            features=plot_features,
+            group_col=report.group_col,
+            target_name=current_target, # 标题显示当前 Target 名
+            sort_by=sort_by,
+            ascending=ascending,
+            dpi=dpi
+        )
+        
+        # 增加一个分隔线日志，方便区分不同 Target 的图
+        if len(target_list) > 1:
+            logger.info(f"{'-'*40}")
