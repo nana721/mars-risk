@@ -1,3 +1,7 @@
+import os
+import sys
+from copy import copy
+
 import polars as pl
 import pandas as pd
 import numpy as np
@@ -684,78 +688,149 @@ class MarsEvaluationReport:
         format_cols = [c for c in df.select_dtypes(include=[np.number]).columns]
         return styler.format("{:.4f}", subset=format_cols)
 
-    def write_excel(self, path: str = "mars_evaluation_report.xlsx", ascending: bool = True) -> None:
+    def write_excel(self, path: str = "mars_bin_report.xlsx") -> None:
         """
-        导出为带有条件格式的 Excel 监控报表。
+        [Professional Export] 自动化导出分箱明细表。
+        
+        自动识别环境: Win/Mac 调用 Excel (xlwings), Linux 纯代码解析 (openpyxl)。
+        自动定位模板: 自动寻找代码同级目录下的 .xlsx 模板文件。
+        """
+        # --- 0. 自动定位模板路径 ---
+        # 获取当前脚本文件所在的绝对目录
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        # --- 配置内部参数 ---
+        START_WRITE_ROW = 4
+        STYLE_SOURCE_ROW = 2
+        FONT_NAME = "Microsoft YaHei"
+        FONT_SIZE = 8
+        SHEET_NAME = "分组明细"
 
-        Parameters
-        ----------
-        path : str
-            输出路径。
-        ascending : bool, default True
-            趋势表中时间列的排序方式。True 为时间早的在前，False 为时间晚的在前。
-        """
-        logger.info(f"📊 Exporting evaluation report to: {path}...")
-        try:
-            with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
-                # 1. Summary Sheet
-                summary_pd = self._to_pd(self.summary_table)
-                summary_pd.to_excel(writer, sheet_name="Summary", index=False)
+        # --- 环境检测 ---
+        IS_GUI_ENV = sys.platform.startswith("win") or sys.platform.startswith("darwin")
+        USE_XLWINGS = False
+        
+        # 定义模板文件名 (尚未拼接路径)
+        template_name_win = "mars_bin_report_win_mac.xlsx"
+        template_name_linux = "mars_bin_report_linux.xlsx"
+        
+        # 最终使用的模板路径变量
+        template_path = ""
+
+        if IS_GUI_ENV:
+            try:
+                import xlwings as xw
+                # 尝试静默启动 Excel 实例
+                app = xw.App(visible=False, add_book=False)
+                app.display_alerts = False
+                app.screen_updating = False
+                USE_XLWINGS = True
                 
-                # 2. Trend Sheets
-                for metric, original_data in self.trend_tables.items():
-                    df = self._to_pd(original_data).copy()
-                    
-                    # --- [新增] 应用与 show_trend 一致的排序逻辑 ---
-                    meta_cols = ["feature", "dtype"]
-                    special_cols = ["Total"]
-                    time_cols = [c for c in df.columns if c not in meta_cols + special_cols]
-                    
-                    # 对时间列排序
-                    time_cols_sorted = sorted(time_cols, reverse=not ascending)
-                    
-                    # 重新排列 Excel 中的列顺序
-                    final_cols = [c for c in meta_cols if c in df.columns] + \
-                                 time_cols_sorted + \
-                                 [c for c in special_cols if c in df.columns]
-                    df = df[final_cols]
-                    # ---------------------------------------------
+                # [修改] 拼接绝对路径
+                template_path = os.path.join(base_dir, template_name_win)
+                
+            except Exception:
+                USE_XLWINGS = False
+        
+        if not USE_XLWINGS:
+            import openpyxl
+            from openpyxl.styles import Font
+            from openpyxl.utils import get_column_letter
+            
+            # [修改] 拼接绝对路径
+            template_path = os.path.join(base_dir, template_name_linux)
 
-                    sheet_name = f"Trend_{metric.upper()}"
-                    df.to_excel(writer, sheet_name=sheet_name, index=False)
-                    
-                    workbook = writer.book
-                    worksheet = writer.sheets[sheet_name]
-                    
-                    # 计算条件格式的作用范围
-                    first_row = 1
-                    last_row = len(df)
-                    start_col_idx = len([c for c in meta_cols if c in df.columns])
-                    end_col_idx = start_col_idx + len(time_cols_sorted) - 1
+        # [新增] 检查模板是否存在，友好报错
+        if not os.path.exists(template_path):
+            raise FileNotFoundError(f"❌ Template file not found at: {template_path}")
 
-                    # 3. 应用条件格式 (仅作用于时间列，不含 Total)
-                    if metric == "psi":
-                        worksheet.conditional_format(first_row, start_col_idx, last_row, end_col_idx, {
-                            'type': '3_color_scale',
-                            'min_type': 'num', 'min_value': 0,    'min_color': '#63BE7B',
-                            'mid_type': 'num', 'mid_value': 0.1,  'mid_color': '#FFEB84',
-                            'max_type': 'num', 'max_value': 0.25, 'max_color': '#F8696B'
-                        })
-                    elif metric in ["auc", "ks", "iv", "risk_corr"]: 
-                        worksheet.conditional_format(first_row, start_col_idx, last_row, end_col_idx, {
-                            'type': '2_color_scale',
-                            'min_color': '#F8696B',
-                            'max_color': '#63BE7B'
-                        })
-                    elif metric == "bad_rate":
-                        worksheet.conditional_format(first_row, start_col_idx, last_row, end_col_idx, {
-                            'type': '2_color_scale',
-                            'min_color': '#FFFFFF',
-                            'max_color': '#2E75B6'
-                        })
-                    
-                    worksheet.autofit()
-                    
-            logger.info("✅ Export successful.")
-        except Exception as e:
-            logger.error(f"❌ Export failed: {e}")
+        # 准备数据
+        df_pd = self._to_pd(self.detail_table)
+        total_cols = len(df_pd.columns)
+
+        # ------------------ 路径 A: xlwings (Win/Mac) ------------------
+        if USE_XLWINGS:
+            try:
+                wb = app.books.open(template_path)
+                ws = wb.sheets[SHEET_NAME]
+                
+                # 修复日期整数问题：强制文本化
+                if 'mars_group' in df_pd.columns:
+                    df_pd['mars_group'] = "'" + df_pd['mars_group'].astype(str)
+                
+                # 批量写入数据
+                ws.range((START_WRITE_ROW, 1)).value = df_pd.values
+                final_row = START_WRITE_ROW + len(df_pd) - 1
+                
+                # 应用样式 (模拟格式刷)
+                source_range = ws.range((STYLE_SOURCE_ROW, 1), (STYLE_SOURCE_ROW, total_cols))
+                data_range = ws.range((START_WRITE_ROW, 1), (final_row, total_cols))
+                source_range.copy()
+                data_range.api.PasteSpecial(Paste=-4122) # xlPasteFormats
+                
+                # 刷新全表字体
+                all_used = ws.used_range
+                all_used.api.Font.Name = FONT_NAME
+                all_used.api.Font.Size = FONT_SIZE
+                
+                # 更新超级表 Table 范围
+                if ws.api.ListObjects.Count > 0:
+                    table = ws.api.ListObjects(1)
+                    new_ref = ws.range((1, 1), (final_row, total_cols)).get_address(False, False)
+                    table.Resize(ws.range(new_ref).api)
+                
+                # 清理多余旧数据
+                last_row = ws.api.UsedRange.Rows.Count
+                if last_row > final_row:
+                    ws.range(f"{final_row + 1}:{last_row}").api.Delete()
+                
+                wb.save(path)
+                print(f"✅ [{sys.platform}] 导出成功 (使用 xlwings)")
+            finally:
+                wb.close()
+                app.quit()
+        
+        # ------------------ 路径 B: openpyxl (Linux) ------------------
+        else:
+            wb = openpyxl.load_workbook(template_path)
+            ws = wb[SHEET_NAME]
+            # 兼容性检查：如果列不存在则跳过日期格式化
+            mars_group_idx = -1
+            if "mars_group" in df_pd.columns:
+                mars_group_idx = list(df_pd.columns).index("mars_group") + 1
+            
+            # 抓取并重构样式
+            template_styles = {}
+            for c_idx in range(1, total_cols + 1):
+                src = ws.cell(row=STYLE_SOURCE_ROW, column=c_idx)
+                template_styles[c_idx] = {
+                    "font": Font(name=FONT_NAME, size=FONT_SIZE, bold=src.font.bold, color=src.font.color),
+                    "border": copy(src.border), "fill": copy(src.fill),
+                    "num_fmt": src.number_format, "align": copy(src.alignment)
+                }
+            
+            # 写入数据并同步样式
+            for r_idx, row_vals in enumerate(df_pd.values, 1):
+                curr_row = START_WRITE_ROW + r_idx - 1
+                for c_idx, val in enumerate(row_vals, 1):
+                    cell = ws.cell(row=curr_row, column=c_idx, value=val)
+                    s = template_styles.get(c_idx)
+                    if s:
+                        cell.font, cell.border, cell.fill, cell.alignment = s["font"], s["border"], s["fill"], s["align"]
+                        # 强制修复日期列格式问题
+                        cell.number_format = "yyyy-mm-dd" if c_idx == mars_group_idx else s["num_fmt"]
+            
+            final_row = START_WRITE_ROW + len(df_pd) - 1
+            # 清理旧行 & 更新超级表
+            if ws.max_row > final_row: ws.delete_rows(final_row + 1, ws.max_row - final_row)
+            if ws.tables:
+                table = next(iter(ws.tables.values()))
+                table.ref = f"A1:{get_column_letter(total_cols)}{final_row}"
+            
+            # 补修表头字体
+            for r in range(1, START_WRITE_ROW):
+                for c in range(1, total_cols + 1):
+                    ws.cell(r, c).font = Font(name=FONT_NAME, size=FONT_SIZE, bold=ws.cell(r, c).font.bold)
+            
+            wb.save(path)
+            print(f"✅ [Linux/NoExcel] 导出成功 (使用 openpyxl)")

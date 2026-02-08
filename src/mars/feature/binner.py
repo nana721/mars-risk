@@ -654,6 +654,49 @@ class MarsBinnerBase(MarsTransformer):
         # 清理 Join 产生的临时列
         return X.with_columns(exprs).drop(temp_join_cols).lazy() if lazy else X.with_columns(exprs).drop(temp_join_cols)
 
+    @staticmethod
+    def _detect_trend_scientific(woes: List[float]) -> str:
+        """
+        [科学判定] 基于 NumPy 的严格单调性检测。
+        逻辑对齐: optbinning.binning.auto_monotonic.type_of_monotonic_trend
+        """
+        # 1. 清洗与预检
+        y = np.array([w for w in woes if w is not None and not np.isnan(w)])
+        n = len(y)
+        
+        if n < 2: 
+            return "scanty"
+            
+        # 2. 计算差分
+        diff = np.diff(y)
+        
+        # 3. 严格单调性 (Ascending / Descending)
+        if np.all(diff >= 0): 
+            return "ascending"
+        if np.all(diff <= 0): 
+            return "descending"
+            
+        if n < 3: 
+            return "undefined" # 非单调且点数少于3，无法构成峰谷
+
+        # 4. Peak (倒U型)
+        #    Max 必须在中间 (0 < t < n-1)
+        t_max = np.argmax(y)
+        if 0 < t_max < n - 1:
+            # 左侧单调增，右侧单调减
+            if np.all(diff[:t_max] >= 0) and np.all(diff[t_max:] <= 0):
+                return "peak"
+
+        # 5. Valley (U型)
+        #    Min 必须在中间 (0 < t < n-1)
+        t_min = np.argmin(y)
+        if 0 < t_min < n - 1:
+            # 左侧单调减，右侧单调增
+            if np.all(diff[:t_min] <= 0) and np.all(diff[t_min:] >= 0):
+                return "valley"
+
+        return "undefined"
+    
     @time_it
     def profile_bin_performance(self, X: pl.DataFrame, y: Any, update_woe: bool = True) -> pl.DataFrame:
         """
@@ -744,6 +787,9 @@ class MarsBinnerBase(MarsTransformer):
                 pl.len().alias("count"),
                 pl.col(y_name).sum().alias("bad")
             ])
+            .with_columns(
+                pl.col("feature").str.replace("_bin", "")
+            )
             .with_columns([
                 (pl.col("count") - pl.col("bad")).alias("good")
             ])
@@ -864,6 +910,30 @@ class MarsBinnerBase(MarsTransformer):
                 pl.all().exclude(["feature", "bin_index", "bin_label"])
             ])
         )
+
+        # 计算 Monotonic Trend Shape
+        trend_df = (
+            stats_df.lazy()
+            .filter(pl.col("bin_index") >= 0) # 排除 Missing/Special
+            .sort(["feature", "bin_index"])   # 确保物理顺序
+            .group_by("feature")
+            .agg(pl.col("woe"))
+            .with_columns(
+                pl.col("woe").map_elements(
+                    self._detect_trend_scientific, 
+                    return_dtype=pl.Utf8
+                ).alias("trend_shape")
+            )
+            .select(["feature", "trend_shape"])
+            .collect()
+        )
+        
+        final_df = final_df.join(trend_df, on="feature", how="left").fill_null(pl.lit("undefined"))
+        
+        # 调整列展示顺序
+        base_cols = ["feature", "bin_label", "trend_shape"]
+        other_cols = [c for c in final_df.columns if c not in base_cols]
+        final_df = final_df.select(base_cols + other_cols)
 
         return final_df
 

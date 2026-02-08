@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Any, List, Optional, Union, Literal
+from typing import Any, List, Optional, Union, Literal, Dict
 import re
 
 import polars as pl
@@ -325,3 +325,134 @@ class MarsTransformer(MarsBaseEstimator, TransformerMixin, ABC):
         必须返回 Polars DataFrame。
         """
         pass
+    
+
+
+class MarsBaseSelector(MarsBaseEstimator, ABC):
+    """
+    [特征筛选器基类] MarsBaseSelector
+    
+    所有特征筛选组件 (Stats, Linear, Importance) 的父类。
+    它封装了特征管理的通用逻辑，并提供了一套标准的“尸检报告”生成机制。
+    
+    Attributes
+    ----------
+    selected_features_ : List[str]
+        最终幸存的特征列表。
+    n_features_in_ : int
+        初始输入的特征数量。
+    report_records_ : List[Dict[str, Any]]
+        筛选过程的详细日志记录。
+        格式: [{'feature': 'age', 'status': 'Dropped', 'stage': 'Quality', 'reason': 'Missing>0.95', 'value': 0.98}, ...]
+    """
+
+    def __init__(self, target_col: str):
+        super().__init__()
+        self.target_col = target_col
+        
+        # 状态属性
+        self.selected_features_: List[str] = []
+        self.n_features_in_: int = 0
+        self.report_records_: List[Dict[str, Any]] = []
+        self._is_fitted: bool = False
+
+    @abstractmethod
+    def fit(self, X: Union[pl.DataFrame, pd.DataFrame], y: Optional[Any] = None) -> "MarsBaseSelector":
+        """
+        [抽象方法] 执行筛选逻辑。必须由子类实现。
+        """
+        pass
+
+    def transform(self, X: Union[pl.DataFrame, pd.DataFrame]) -> pl.DataFrame:
+        """
+        [通用方法] 根据筛选结果裁剪特征。
+        
+        只保留 selected_features_ 中的列，以及 target_col (如果存在)。
+        """
+        self._check_is_fitted()
+        X = self._ensure_polars_dataframe(X)
+        
+        # 构造保留列表：选中特征 + 目标列(若存在)
+        # 注意：我们通常不删 Target，方便 Pipeline 后续步骤使用
+        cols_to_keep = [c for c in self.selected_features_ if c in X.columns]
+        
+        # 如果原始数据里有 Target，也带上（除非它已经在 selected_features_ 里）
+        if self.target_col in X.columns and self.target_col not in cols_to_keep:
+            cols_to_keep.append(self.target_col)
+            
+        return X.select(cols_to_keep)
+
+    def get_report(self) -> pl.DataFrame:
+        """
+        [核心功能] 生成特征筛选“尸检报告”。
+        
+        Returns
+        -------
+        pl.DataFrame
+            包含每个特征的筛选状态、淘汰阶段、淘汰原因及具体指标值。
+            Schema: [feature, status, stage, reason, value, description]
+        """
+        self._check_is_fitted()
+        
+        if not self.report_records_:
+            logger.warning("⚠️ No report records found. Did you forget to call `_register_decision` in subclass?")
+            return pl.DataFrame([])
+
+        # 将记录列表转换为 DataFrame
+        report_df = pl.DataFrame(self.report_records_, schema={
+            "feature": pl.Utf8,
+            "status": pl.Utf8,       # 'Selected' / 'Dropped'
+            "stage": pl.Utf8,        # 'Quality', 'IV_Rough', 'PSI'
+            "reason": pl.Utf8,       # 'Low IV', 'High Corr'
+            "value": pl.Float64,     # 具体的指标值 (如 IV=0.001)
+            "description": pl.Utf8   # 详细描述
+        })
+        
+        # 按照 状态(Dropped优先) -> 阶段 -> 特征名 排序
+        return report_df.sort(["status", "stage", "feature"], descending=[False, False, False])
+
+    def _register_decision(
+        self, 
+        feature: str, 
+        status: str, 
+        stage: str, 
+        reason: str = "", 
+        value: float = -1.0,
+        desc: str = ""
+    ):
+        """
+        [Helper] 埋点记录。子类在做决定时调用此方法。
+        
+        Parameters
+        ----------
+        feature : str
+            特征名。
+        status : str
+            'Selected' 或 'Dropped'。
+        stage : str
+            当前筛选阶段 (如 'Rough_Scan', 'VIF_Check')。
+        reason : str
+            决策依据 (如 'IV < 0.02')。
+        value : float
+            关键指标值 (如 0.015)。
+        """
+        self.report_records_.append({
+            "feature": feature,
+            "status": status,
+            "stage": stage,
+            "reason": reason,
+            "value": value,
+            "description": desc
+        })
+
+    def _get_feature_pool(self, X: pl.DataFrame) -> List[str]:
+        """
+        [Helper] 获取初始特征池 (排除 Target 和 非数值列等通用逻辑)。
+        """
+        # 这里可以加入通用的排除逻辑，比如日期列、ID列等
+        # 暂时只排除 Target
+        return [c for c in X.columns if c != self.target_col]
+
+    def _check_is_fitted(self):
+        if not self._is_fitted:
+            raise ValueError(f"{self.__class__.__name__} is not fitted yet. Call 'fit' first.")

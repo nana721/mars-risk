@@ -171,21 +171,28 @@ class MarsPlotter:
         df_trend_calc = df_total[df_total['bin_index'] >= 0].sort_values('bin_index')
         trend_str = "n.a."
         
-        if len(df_trend_calc) > 1:
-            x_arr = df_trend_calc['bin_index'].values
-            y_arr = df_trend_calc['bad_rate'].values
-            
-            # 只有当坏率有波动时才计算相关系数，避免平直线导致的无效计算
-            if np.std(y_arr) > 1e-9: 
-                corr = np.corrcoef(x_arr, y_arr)[0, 1]
-                if corr >= 0.5:
-                    trend_str = f"asc({corr:.2f})" # 整体呈上升趋势
-                elif corr <= -0.5:
-                    trend_str = f"desc({corr:.2f})" # 整体呈下降趋势
+        # 1. 优先尝试从 DataFrame 列中直接获取
+        if "trend" in df_total.columns:
+            # 取第一行的值即可，因为同一个特征在 Total 分组下 trend 是一样的
+            raw_trend = df_total["trend"].iloc[0]
+            # 处理可能的 null 或 undefined
+            if pd.notna(raw_trend) and str(raw_trend).lower() != "undefined":
+                trend_str = str(raw_trend)
+        
+        # 2. 如果上游没有计算 trend (兼容旧版本)，则回退到现场计算逻辑
+        if trend_str == "n.a.":
+            # [Fallback] 原有的现场计算逻辑 (保留作为兜底)
+            df_trend_calc = df_total[df_total['bin_index'] >= 0].sort_values('bin_index')
+            if len(df_trend_calc) > 1:
+                x_arr = df_trend_calc['bin_index'].values
+                y_arr = df_trend_calc['bad_rate'].values
+                if np.std(y_arr) > 1e-9: 
+                    corr = np.corrcoef(x_arr, y_arr)[0, 1]
+                    if corr >= 0.5: trend_str = f"asc({corr:.2f})"
+                    elif corr <= -0.5: trend_str = f"desc({corr:.2f})"
+                    else: trend_str = f"n.a.({corr:.2f})"
                 else:
-                    trend_str = f"n.a.({corr:.2f})" # 无明显单调性
-            else:
-                trend_str = "flat" # 坏率是一条平直线
+                    trend_str = "flat"
         
         # 计算缺失值占比
         missing_row = df_total[df_total['bin_index'] == -1]
@@ -356,7 +363,7 @@ class MarsPlotter:
                 ax.text(j, max(counts) * 0.05, f"{ct_val:.1%}", color='#333333', ha='center', va='bottom', fontsize=fs_text+0.5)
             # --- D. 子图顶部指标汇总 ---
             iv_val  = df_g['iv_bin'].sum()
-            ks_val  = df_g['ks_bin'].max() * 100
+            ks_val  = df_g['ks_bin'].max()
             auc_val = df_g['auc_bin'].sum()
             auc_val = 1 - auc_val if auc_val < 0.5 else auc_val 
             psi_val = df_g['psi_bin'].sum() if 'psi_bin' in df_g.columns else 0.0

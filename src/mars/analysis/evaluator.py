@@ -65,6 +65,8 @@ class MarsBinEvaluator(MarsBaseEstimator):
     >>> report.write_excel("risk_report.xlsx") # 导出 Excel
     """
     
+    # [新增] 定义统一的分组列名常量
+    GROUP_COL_NAME = "mars_group"
 
     def __init__(
         self, 
@@ -98,9 +100,13 @@ class MarsBinEvaluator(MarsBaseEstimator):
         self,
         df: Union[pl.DataFrame, pd.DataFrame],  
         features: Optional[List[str]] = None,
+        *,
         profile_by: Optional[str] = None,
         dt_col: Optional[str] = None,
-        benchmark_df: Union[pl.DataFrame, pd.DataFrame, None] = None, 
+        benchmark_df: Union[pl.DataFrame, pd.DataFrame, None] = None,
+        # [新增参数] PSI 计算控制
+        psi_include_missing: bool = False,
+        psi_include_special: bool = False, 
         weights_col: Optional[str] = None,
         batch_size: int = 500
     ) -> "MarsEvaluationReport":
@@ -167,10 +173,15 @@ class MarsBinEvaluator(MarsBaseEstimator):
         if n_unique < 2:
             logger.warning(f"⚠️ Target '{self.target_col}' has < 2 unique values. Metrics (AUC/KS) may be invalid.")
 
-        # 处理日期聚合逻辑：将日期列转化为 '2023-01' 等格式
-        working_df, group_col = self._prepare_context(working_df, profile_by, dt_col)
+        # [修改] 统一分组列名逻辑
+        # _prepare_context 现在返回处理后的 df，它一定包含一列叫 "mars_group"
+        working_df = self._prepare_context(working_df, profile_by, dt_col)
         
-        # 自动识别特征列：排除目标列、分组列和权重列
+        # 锁定分组列名为常量 "mars_group"
+        group_col = self.GROUP_COL_NAME
+
+        # [修改] 自动识别特征列
+        # 排除 target, weights, 和刚刚生成的统一 mars_group 列
         exclude_cols = {self.target_col, group_col}
         if weights_col: 
             exclude_cols.add(weights_col)
@@ -256,17 +267,23 @@ class MarsBinEvaluator(MarsBaseEstimator):
         # 6. 指标计算 
         logger.debug("🧮 Step 3: Calculating metrics (PSI/AUC/KS/IV)...")
         
-        # 6.1 计算 Trend 数据：每个分组（如每月）的特征表现
+        # 6.1 计算 Trend 数据
         metrics_groups = (
             self._calc_metrics_from_stats(
-                group_stats_raw, expected_dist, group_col
+                group_stats_raw, expected_dist, group_col,
+                # 传参
+                include_missing=psi_include_missing,
+                include_special=psi_include_special
             )
             .with_columns(pl.col(group_col).cast(pl.String))
         )
         
-        # 6.2 计算 Total 数据：特征在全量样本上的表现
+        # 6.2 计算 Total 数据
         metrics_total = self._calc_metrics_from_stats(
-            total_stats_raw, expected_dist, group_col
+            total_stats_raw, expected_dist, group_col,
+            # 传参
+            include_missing=psi_include_missing,
+            include_special=psi_include_special
         )
 
         # 6.3 合并分组与总体结果
@@ -567,7 +584,15 @@ class MarsBinEvaluator(MarsBaseEstimator):
                 .select(["feature", "bin_index", "expected_dist"])
             )
 
-    def _calc_metrics_from_stats(self, stats_df: pl.DataFrame, expected_dist: pl.DataFrame, group_col: str) -> pl.DataFrame:
+    def _calc_metrics_from_stats(
+        self, 
+        stats_df: pl.DataFrame, 
+        expected_dist: pl.DataFrame, 
+        group_col: str,
+        # [PSI 控制参数]
+        include_missing: bool = True,
+        include_special: bool = True
+    ) -> pl.DataFrame:
         """
         [Math Core] 基于聚合结果的向量化指标计算引擎 (Vectorized Metrics Engine).
 
@@ -640,25 +665,83 @@ class MarsBinEvaluator(MarsBaseEstimator):
 
         epsilon = 1e-9
         
-        # 计算分组汇总值
+        # ======================================================================
+        # [优化] 2. 构建 PSI 专用计算域 (Scope Definition)
+        # ======================================================================
+        # 定义哪些箱子参与 PSI 计算
+        # 约定: Missing=-1, Special <= -3, Normal >= 0, Other=-2 (Other通常算正常)
+        psi_valid_cond = pl.lit(True)
+        
+        if not include_missing:
+            psi_valid_cond &= (pl.col("bin_index") != -1)
+        
+        if not include_special:
+            psi_valid_cond &= (pl.col("bin_index") > -3)
+
+        # ======================================================================
+        # [优化] 3. 计算双套分布 (Dual Distribution Calculation)
+        # ======================================================================
+        
+        # 3.1 全量分布 (用于 IV, BadRate, Lift) - 保持原有逻辑
         base_df = base_df.with_columns([
             pl.col("count").sum().over([group_col, "feature"]).alias("total_count"),
             pl.col("bad").sum().over([group_col, "feature"]).alias("total_bad"),
             pl.col("good").sum().over([group_col, "feature"]).alias("total_good"),
         ])
-
-        # 计算占比指标
+        
+        # 3.2 PSI 专用分布 (Re-normalized Distribution)
+        # 利用 filter().sum() 动态计算剔除后的分母
         base_df = base_df.with_columns([
+            # 动态计算 Actual 的有效总数
+            pl.col("count")
+              .filter(psi_valid_cond)
+              .sum()
+              .over([group_col, "feature"])
+              .alias("total_count_psi"),
+            
+            # 动态计算 Expected 的有效总占比 (因为 expected_dist 是比例，sum 可能等于 0.8)
+            pl.col("expected_dist")
+              .filter(psi_valid_cond)
+              .sum()
+              .over([group_col, "feature"])
+              .alias("total_expected_dist_psi")
+        ])
+
+        # ======================================================================
+        # 4. 指标计算
+        # ======================================================================
+        base_df = base_df.with_columns([
+            # --- 常规指标 (基于全量) ---
             ((pl.col("count") + epsilon) / (pl.col("total_count") + epsilon)).alias("actual_dist"),
             (pl.col("bad") / (pl.col("total_bad") + epsilon)).alias("bad_dist"),    
             (pl.col("good") / (pl.col("total_good") + epsilon)).alias("good_dist"), 
             (pl.col("bad") / (pl.col("count") + epsilon)).alias("bad_rate"),        
+            
+            # --- PSI (基于动态归一化) ---
+            # 1. 计算归一化后的 Actual% (只针对有效箱)
+            (pl.col("count") / (pl.col("total_count_psi") + epsilon)).alias("act_prob_clean"),
+            # 2. 计算归一化后的 Expected% (只针对有效箱)
+            #    例如：如果剔除缺失值后，剩余 expected_dist 之和为 0.8，则每一项除以 0.8 放大
+            (pl.col("expected_dist") / (pl.col("total_expected_dist_psi") + epsilon)).alias("exp_prob_clean")
         ])
 
-        # 计算 PSI 和 Lift (无序指标)
+        # 最终计算 PSI bin contribution
         base_df = base_df.with_columns([
-            ((pl.col("actual_dist") - pl.col("expected_dist")) * (pl.col("actual_dist") / pl.col("expected_dist")).log()).alias("psi_bin"),
-            (pl.col("bad_rate") / ((pl.col("total_bad") + epsilon) / (pl.col("total_count") + epsilon))).alias("lift")  
+            # 仅在有效箱上计算 PSI，无效箱置为 None
+            pl.when(psi_valid_cond)
+            .then(
+                (pl.col("act_prob_clean") - pl.col("exp_prob_clean")) * (pl.col("act_prob_clean") / (pl.col("exp_prob_clean") + epsilon)).log()
+            )
+            .otherwise(None)
+            .alias("psi_bin"),
+            
+            # Lift (通常基于全量)
+            (pl.col("bad_rate") / ((pl.col("total_bad") + epsilon) / (pl.col("total_count") + epsilon))).alias("lift"),
+            
+            # IV 
+            (
+                (pl.col("bad_dist") - pl.col("good_dist")) * ((pl.col("bad_dist") + epsilon) / (pl.col("good_dist") + epsilon)).log()
+            ).cast(pl.Float32).alias("iv_bin")
         ])
 
         # 计算有序指标 (AUC, KS, IV)：必须按 WOE 风险程度排序
@@ -672,22 +755,26 @@ class MarsBinEvaluator(MarsBaseEstimator):
 
         sorted_df = sorted_df.with_columns([
 
-            (pl.col("cum_bad_dist") - pl.col("cum_good_dist")).abs().alias("ks_bin"),
+            ((pl.col("cum_bad_dist") - pl.col("cum_good_dist")).abs() * 100).alias("ks_bin"),
             
             # AUC 梯形法则计算面积
             (
                 (pl.col("cum_good_dist") - pl.col("cum_good_dist").shift(1, fill_value=0).over([group_col, "feature"])) 
                 * (pl.col("cum_bad_dist") + pl.col("cum_bad_dist").shift(1, fill_value=0).over([group_col, "feature"])) 
                 / 2
-            ).alias("auc_bin"),
+            ).alias("auc_bin")
+        ])
 
-            # IV：(Good% - Bad%) * ln(Good%/Bad%)
-            ((pl.col("bad_dist") - pl.col("good_dist")) * pl.col("woe")).cast(pl.Float32).alias("iv_bin")
+        sorted_df = sorted_df.with_columns([
+            pl.when(pl.col("psi_bin").abs() < 1e-12)
+              .then(0.0)
+              .otherwise(pl.col("psi_bin"))
+              .alias("psi_bin")
         ])
 
         return sorted_df
 
-    def _prepare_context(self, df: pl.DataFrame, profile_by: Optional[str], dt_col: Optional[str]) -> Tuple[pl.DataFrame, str]:
+    def _prepare_context(self, df: pl.DataFrame, profile_by: Optional[str], dt_col: Optional[str]) -> pl.DataFrame:
         """
         [Helper] 上下文准备：标准化分组维度 (Context Preparation).
 
@@ -728,12 +815,14 @@ class MarsBinEvaluator(MarsBaseEstimator):
            将所有样本视为同一个分组（适用于单点评估）。
         """
         
-        # 有时间列没分组 -> 默认按月
+        target_col_name = self.GROUP_COL_NAME
+        
+        # 1. 智能默认：有时间没分组 -> 默认按月
         if dt_col and not profile_by:
-            logger.info(f"ℹ️ `dt_col` provided ('{dt_col}') without `profile_by`. Defaulting trend to 'month'.")
+            logger.info(f"ℹ️ `dt_col` provided without `profile_by`. Defaulting trend to 'month'.")
             profile_by = "month"
 
-        # 处理时间切片
+        # 2. 处理时间切片 (Day/Week/Month)
         if dt_col and profile_by in ["day", "week", "month"]:
             if profile_by == "month":
                 date_expr = MarsDate.dt2month(dt_col)
@@ -742,30 +831,24 @@ class MarsBinEvaluator(MarsBaseEstimator):
             else:
                 date_expr = MarsDate.dt2day(dt_col)
             
-            temp_group = f"_mars_auto_{profile_by}"
-            # 这里生成一个新的临时列作为分组列
-            return df.with_columns(date_expr.alias(temp_group)), temp_group
+            # 直接 alias 为统一列名 "group"
+            return df.with_columns(date_expr.alias(target_col_name))
         
-        # 常规分组
+        # 3. 常规分组 (按现有列)
         if profile_by:
-            # 简单的校验，防止用户拼写错误
-            if profile_by not in df.columns:
-                # 此时可能是用户想按月分，但没传 dt_col，或者单纯写错了
-                logger.warning(
-                    f"⚠️ Specified `profile_by` column '{profile_by}' not found in DataFrame. "
-                    f"Available columns: {df.columns[:5]}..."
-                )
-                logger.info("👉 Falling back to single snapshot mode (Group='Total').")
-                # 兜底逻辑
-                fallback_col = "_mars_auto_total"
-                return df.with_columns(pl.lit("Total").alias(fallback_col)), fallback_col
-                
-            return df, profile_by
+            if profile_by in df.columns:
+                # 如果该列已经存在，且名字不是 "group"，则复制一份并重命名
+                # (使用 with_columns 而不是 rename，防止破坏原始列供其他用途)
+                if profile_by != target_col_name:
+                    return df.with_columns(pl.col(profile_by).cast(pl.String).alias(target_col_name))
+                return df
+            else:
+                logger.warning(f"⚠️ Column '{profile_by}' not found. Falling back to Snapshot mode.")
 
-        # 兜底逻辑：用户啥都没传 -> 视为单点评估 (Snapshot)
-        logger.info("ℹ️ No grouping specified. Evaluating as a single snapshot (Group='Total').")
-        fallback_col = "_mars_auto_total"
-        return df.with_columns(pl.lit("Total").alias(fallback_col)), fallback_col
+        # 4. 兜底逻辑：单点评估 (Snapshot)
+        # 生成一个全为 "Total" 的列，名为 "group"
+        logger.info(f"ℹ️ Evaluating as a single snapshot ({target_col_name}='Total').")
+        return df.with_columns(pl.lit("Total").alias(target_col_name))
 
     def _format_report(
         self, 
@@ -844,29 +927,206 @@ class MarsBinEvaluator(MarsBaseEstimator):
         # ==============================================================================
         # Part 1: Detail Table (明细表构造)
         # ==============================================================================
+        
         # 映射分箱 Label 
         map_rows = []
         feats = set(stats_long["feature"].unique().to_list())
+        
         for f, m in self.binner.bin_mappings_.items():
             if f in feats:
-                for i, l in m.items(): map_rows.append({"feature":f, "bin_index":i, "bin_label":l})
+                for i, l in m.items(): 
+                    # [关键修复] 强制将字典 Key 转为 int，防止 JSON 里的字符串 Key 污染类型
+                    try:
+                        idx_val = int(i)
+                        map_rows.append({"feature": f, "bin_index": idx_val, "bin_label": str(l)})
+                    except (ValueError, TypeError):
+                        continue 
         
+        # [修复] 显式指定 Schema 为 Int16
         map_schema = {"feature": pl.String, "bin_index": pl.Int16, "bin_label": pl.String}
-        map_df = pl.DataFrame(map_rows, schema=map_schema) if map_rows else pl.DataFrame([], schema=map_schema)
+        
+        if map_rows:
+            map_df = pl.DataFrame(map_rows, schema=map_schema)
+        else:
+            map_df = pl.DataFrame([], schema=map_schema)
 
-        # 关联 Label 并保留关键列
-        detail_table = (
+        # 1. 关联 Label
+        # 此时 stats_long 和 map_df 都是 Int16，Join 安全，不会发生类型提升
+        detail_base = (
             stats_long
             .join(map_df, on=["feature", "bin_index"], how="left")
             .with_columns(pl.col("bin_label").fill_null(pl.col("bin_index").cast(pl.Utf8)))
-            .select(
-                [
-                    "feature", group_col, "bin_index", "bin_label", 
-                    "count", "bad", "bad_rate", "lift", "psi_bin", "ks_bin", "auc_bin", "iv_bin", "total_count"
-                ]
-            )
-            .sort(["feature", group_col, "bin_index"])
         )
+
+        # ==============================================================================
+        # Part 1.5: Trend Shape Injection (计算并注入单调性形状)
+        # ==============================================================================
+        
+        # 1. 提取 WOE 序列
+        trend_source = (
+            metrics_total  # 使用 Total 数据
+            .lazy()
+            .filter(pl.col("bin_index") >= 0)  # 这里现在是安全的，因为 bin_index 确认为 Int16
+            .sort(["feature", "bin_index"])
+            .select(["feature", "woe"])
+        )
+        
+        # 2. 调用 Binner 中的静态方法进行判断
+        from mars.feature.binner import MarsBinnerBase 
+
+        trend_shape_df = (
+            trend_source
+            .group_by("feature")
+            .agg(pl.col("woe"))
+            .with_columns(
+                pl.col("woe").map_elements(
+                    MarsBinnerBase._detect_trend_scientific, 
+                    return_dtype=pl.Utf8
+                ).alias("trend")
+            )
+            .select(["feature", "trend"])
+            .collect()
+        )
+
+        # 3. 将趋势列 Join 回明细基表
+        detail_base = detail_base.join(trend_shape_df, on="feature", how="left")
+
+        # 2. [Modified] 构建自定义排序键 (Sort Key)
+        # 显式 cast(pl.Int32) 解决 SchemaError
+        detail_table = (
+            detail_base
+            .with_columns([
+                # 构建排序辅助列 (0:Normal, 1:Special/Missing, 2:Total)
+                pl.when(pl.col("bin_index") >= 0).then(0).otherwise(1).cast(pl.Int32).alias("_sort_group"),
+                
+                # 针对非 Normal 箱的内部排序:
+                # -1 (Missing) -> 10000
+                # -2 (Other) -> 10001
+                # < -2 (Special) -> 20000 + abs
+                pl.when(pl.col("bin_index") >= 0).then(pl.col("bin_index").cast(pl.Int32)) # 显式转 Int32
+                  .when(pl.col("bin_index") == -1).then(10000) 
+                  .when(pl.col("bin_index") == -2).then(10001) 
+                  .otherwise(20000 + pl.col("bin_index").abs().cast(pl.Int32)) 
+                  .alias("_sort_idx")
+            ])
+            .sort(["feature", group_col, "_sort_group", "_sort_idx"]) # 执行物理排序
+        )
+
+        # 3. [新增] 计算累积指标 (Cumulative Metrics)
+        detail_table = detail_table.with_columns([
+            # 累积样本数
+            pl.col("count").cum_sum().over(["feature", group_col]).alias("cum_count"),
+            # 累积坏样本数
+            pl.col("bad").cum_sum().over(["feature", group_col]).alias("cum_bad"),
+            # 累积好样本数
+            (pl.col("count") - pl.col("bad")).cum_sum().over(["feature", group_col]).alias("cum_good")
+        ]).with_columns([
+            # 累积坏账率 = 累积坏 / 累积总
+            (pl.col("cum_bad") / (pl.col("cum_count") + 1e-9)).alias("cum_bad_rate"),
+            
+            # [新增] 计算箱占比 pct = count / total_count
+            # total_count 已经在 _calc_metrics_from_stats 中计算并包含在 stats_long 中
+            (pl.col("count") / (pl.col("total_count") + 1e-9)).alias("pct"),
+            
+            pl.col("bin_index").max().over(["feature", group_col]).alias("bin_index_max")
+        ]).with_columns([
+            pl.when(
+                (pl.col("bin_index") == pl.col("bin_index_max")) | (pl.col("bin_index") == 0)
+            )
+            .then(pl.lit("首尾组"))
+            .when(
+                (pl.col("bin_index") == -1)
+            )
+            .then(pl.lit("空值组"))
+            .when(
+                (pl.col("bin_index") == -2)
+            )
+            .then(pl.lit("其他组"))
+            .when(
+                (pl.col("bin_index") <= -3)
+            )
+            .then(pl.lit("特殊组"))
+            .otherwise(pl.lit("正常组"))
+            .alias("bin_type")
+        
+        ])
+
+        # ==============================================================================
+        # 3.5 [新增] 构造 Total 汇总行 (Aggregation for Total Row)
+        # ==============================================================================
+        # 对每个 (feature, group) 生成一行汇总数据，包含计算后的综合指标
+        total_rows = (
+            stats_long
+            .group_by(["feature", group_col])
+            .agg([
+                # 基础统计量汇总
+                pl.col("count").sum().alias("count"),
+                pl.col("bad").sum().alias("bad"),
+                pl.col("iv_bin").sum().alias("iv_bin"),  
+                pl.col("psi_bin").sum().alias("psi_bin"), 
+                pl.col("auc_bin").sum().alias("auc_bin"), 
+                pl.col("ks_bin").max().alias("ks_bin"),   
+                pl.col("lift").max().alias("lift"), 
+                pl.col("count").sum().alias("total_count")
+            ])
+            .with_columns([
+                # 衍生列
+                (pl.col("count") - pl.col("bad")).alias("good"),
+                (pl.col("bad") / (pl.col("count") + 1e-9)).alias("bad_rate"),
+
+                # [新增] Total 行的占比恒为 1.0
+                pl.lit(1.0).alias("pct"),
+                
+                # 累积列 (对于 Total 行，累积值等于自身)
+                pl.col("count").alias("cum_count"),
+                pl.col("bad").alias("cum_bad"),
+                (pl.col("bad") / (pl.col("count") + 1e-9)).alias("cum_bad_rate"),
+                
+                # AUC 方向修正
+                pl.when(pl.col("auc_bin") < 0.5)
+                  .then(pl.lit(1) - pl.col("auc_bin"))
+                  .otherwise(pl.col("auc_bin"))
+                  .alias("auc_bin"),
+                
+                # 标识列与排序键 (确保排在最后)
+                pl.lit(9999).cast(pl.Int16).alias("bin_index"),
+                pl.lit("Total").alias("bin_label"),
+                
+                pl.lit("汇总组").alias("bin_type"),
+                
+                pl.lit(2).cast(pl.Int32).alias("_sort_group"), # [Fix] Int32
+                pl.lit(0).cast(pl.Int32).alias("_sort_idx")    # [Fix] Int32
+            ])
+        )
+
+        # [修复] Total 行也要 join trend 列
+        total_rows = total_rows.join(trend_shape_df, on="feature", how="left")
+
+        target_cols = [
+            "feature", group_col, "bin_index", "bin_label", "_sort_group", "_sort_idx",
+            "count", "pct", "bad", "good", "bad_rate", "lift", "trend",
+            "cum_count", "cum_bad", "cum_bad_rate",
+            "psi_bin", "ks_bin", "auc_bin", "iv_bin", "total_count",
+            "bin_type"
+        ]
+        
+        detail_table = (
+            pl.concat([
+                detail_table.select(target_cols),
+                total_rows.select(target_cols)
+            ])
+            .sort(["feature", group_col, "_sort_group", "_sort_idx"])
+        )
+
+        # 4. 选择最终输出列
+        detail_table = detail_table.select([
+            pl.lit(self.target_col).alias("y"),
+            "feature", "trend", group_col, "bin_index", "bin_label", 
+            "count", "bad", "good", "pct", "bad_rate", "lift", 
+            "cum_count", "cum_bad", "cum_bad_rate",
+            "psi_bin", "ks_bin", "auc_bin", "iv_bin", "total_count",
+            "bin_type"
+        ])
 
         # ==============================================================================
         # Part 2: Intermediate Calculations (中间指标计算)
@@ -1082,14 +1342,14 @@ class MarsBinEvaluator(MarsBaseEstimator):
         
         # 1. 尝试从 Report 提取绘图所需数据
         if report is not None:
-            target_df = report.detail_table
+            target_df = report.detail_table.filter(pl.col("bin_index") != 9999) 
             target_group_col = report.group_col
         # 2. 尝试从 df_detail 提取数据
         elif df_detail is not None:
             if isinstance(df_detail, pd.DataFrame):
-                target_df = pl.from_pandas(df_detail)
+                target_df = pl.from_pandas(df_detail).filter(pl.col("bin_index") != 9999)
             else:
-                target_df = df_detail
+                target_df = df_detail.filter(pl.col("bin_index") != 9999)
                 
             if group_col:
                 target_group_col = group_col
@@ -1127,6 +1387,9 @@ class MarsBinEvaluator(MarsBaseEstimator):
         dt_col: Optional[str] = None,
         target_col: Optional[str] = None, 
         benchmark_df: Union[pl.DataFrame, pd.DataFrame, None] = None,
+        # [新增参数] 
+        psi_include_missing: bool = False,
+        psi_include_special: bool = False,
         weights_col: Optional[str] = None,
         batch_size: int = 500,
         
@@ -1322,6 +1585,9 @@ class MarsBinEvaluator(MarsBaseEstimator):
                 features=features,
                 profile_by=profile_by,
                 dt_col=dt_col,
+                # 传参
+                psi_include_missing=psi_include_missing,
+                psi_include_special=psi_include_special,
                 benchmark_df=benchmark_df,
                 weights_col=weights_col,
                 batch_size=batch_size

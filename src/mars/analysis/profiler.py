@@ -869,6 +869,10 @@ class MarsDataProfiler(MarsBaseEstimator):
         psi_result_parts = []
         common_schema_order = [group_col, "feature", "total", "psi"]
         
+        # 获取配置中的开关
+        inc_missing = self.config.psi_include_missing
+        inc_special = self.config.psi_include_special
+        
         BATCH_SIZE = self.psi_batch_size 
         # ==============================================================================
         # 🟢 路一：数值特征 PSI 
@@ -946,7 +950,11 @@ class MarsDataProfiler(MarsBaseEstimator):
                         stats_df=lf_agg_stats_batch, 
                         unique_bins_skel=lf_unique_bins_skel, 
                         group_col=group_col, 
-                        baseline_group=baseline_group
+                        baseline_group=baseline_group,
+                        # [新增] 传入数值型的标记
+                        is_numeric_bin_id=True, 
+                        include_missing=inc_missing,
+                        include_special=inc_special
                     )
 
                     # F. [还原] 保持 Lazy 链条
@@ -999,7 +1007,11 @@ class MarsDataProfiler(MarsBaseEstimator):
                     stats_df=lf_long_cat, 
                     unique_bins_skel=lf_unique_bins_cat, 
                     group_col=group_col, 
-                    baseline_group=baseline_group
+                    baseline_group=baseline_group,
+                    # [新增] 传入类别型的标记
+                    is_numeric_bin_id=False,
+                    include_missing=inc_missing,
+                    include_special=inc_special
                 )
 
                 # 4. 执行并存入结果集
@@ -1070,7 +1082,11 @@ class MarsDataProfiler(MarsBaseEstimator):
         stats_df: pl.LazyFrame,  
         unique_bins_skel: pl.LazyFrame, 
         group_col: str, 
-        baseline_group: Any
+        baseline_group: Any,
+        # [新增参数]
+        is_numeric_bin_id: bool = True,
+        include_missing: bool = True,
+        include_special: bool = True
     ) -> pl.LazyFrame: # 返回 LazyFrame
         """
         [Math Core] 基于聚合后的频次表 (Count Table) 计算 PSI。
@@ -1118,14 +1134,61 @@ class MarsDataProfiler(MarsBaseEstimator):
         epsilon = 1e-6
         div_safe = 1e-9  # 防止分母为 0 的保险系数
 
-        # 1. 自动生成完整的 [分组 x 特征 x 分箱] 骨架 (Lazy)
-        # 这样可以确保每个分组里都有完整的特征分箱名单
-        unique_groups = stats_df.select(group_col).unique()
-        full_skeleton = unique_bins_skel.join(unique_groups, how="cross")
+        # ======================================================================
+        # [新增] 1. 动态过滤逻辑 (Filtering Logic)
+        # ======================================================================
+        # 在计算占比之前，先剔除不需要参与 PSI 计算的箱。
+        # 这样 sum().over() 的分母会自动变成 "剔除后的总样本量"。
+        
+        filter_cond = pl.lit(True)
 
-        # 2. 计算基准分布 (Expected)
+        if is_numeric_bin_id:
+            # --- 数值型逻辑 (基于 Int 索引) ---
+            # 约定: Missing=-1, Special <= -3, Normal >= 0, Other=-2(通常算作正常分布的一部分)
+            
+            if not include_missing:
+                # 剔除 -1 (IDX_MISSING)
+                filter_cond &= (pl.col("bin_id") != -1)
+            
+            if not include_special:
+                # 剔除 <= -3 (IDX_SPECIAL_START)
+                filter_cond &= (pl.col("bin_id") > -2) 
+
+        else:
+            # --- 类别型逻辑 (基于 String 值) ---
+            # 约定: Missing="Missing" (在 _get_psi_trend 中定义的 fill_null)
+            # Special = 在 self.special_values 列表中的值
+            
+            if not include_missing:
+                # 兼容 "Missing" 字符串和可能的 null
+                filter_cond &= (pl.col("bin_id") != "Missing") & (pl.col("bin_id").is_not_null())
+            
+            if not include_special and self.special_values:
+                # 确保类型匹配，转为字符串列表进行比较
+                special_str_list = [str(v) for v in self.special_values]
+                filter_cond &= (~pl.col("bin_id").is_in(special_str_list))
+
+        # 应用过滤
+        # 注意: 这里的 filtered_stats 仅包含被选中的箱子
+        filtered_stats = stats_df.filter(filter_cond)
+        
+        # 同时也需要过滤骨架，否则 Left Join 时会把剔除的箱子又加回来(变成空箱)
+        # 导致分母不一致或 PSI 计算错误
+        filtered_skel = unique_bins_skel.filter(filter_cond)
+
+        # ======================================================================
+        # 2. 自动生成完整的 [分组 x 特征 x 分箱] 骨架
+        # ======================================================================
+        # [修改] 使用 filtered_stats 获取 unique_groups，确保只处理剩下的数据
+        unique_groups = filtered_stats.select(group_col).unique()
+        full_skeleton = filtered_skel.join(unique_groups, how="cross")
+
+        # ======================================================================
+        # 3. 计算基准分布 (Expected) - E
+        # ======================================================================
+        # [注意] 此时的分母 sum("len") 已经是剔除后的总数了
         expected = (
-            stats_df
+            filtered_stats
             .filter(pl.col(group_col) == baseline_group)
             .with_columns(
                 (pl.col("len") / (pl.col("len").sum().over(feat_col) + div_safe)).alias("E")
@@ -1133,18 +1196,22 @@ class MarsDataProfiler(MarsBaseEstimator):
             .select([feat_col, "bin_id", "E"])
         )
 
-        # 3. 计算实际分布 (Actual)
+        # ======================================================================
+        # 4. 计算实际分布 (Actual) - A
+        # ======================================================================
         actual = (
-            stats_df
+            filtered_stats
             .with_columns(
                 (pl.col("len") / (pl.col("len").sum().over([group_col, feat_col]) + div_safe)).alias("A")
             )
             .select([group_col, feat_col, "bin_id", "A"])
         )
 
-        # 4. 计算全量分布 (Global Actual)
+        # ======================================================================
+        # 5. 计算全量分布 (Global Actual) - A_global
+        # ======================================================================
         global_actual = (
-            stats_df
+            filtered_stats
             .group_by([feat_col, "bin_id"])
             .agg(pl.col("len").sum().alias("total_len"))
             .with_columns(
@@ -1153,7 +1220,9 @@ class MarsDataProfiler(MarsBaseEstimator):
             .select([feat_col, "bin_id", "A_global"])
         )
 
-        # 5. 核心计算逻辑 (Left Join 骨架并填充 epsilon)
+        # ======================================================================
+        # 6. 核心 PSI 聚合
+        # ======================================================================
         # 计算分组 PSI
         psi_group = (
             full_skeleton
@@ -1172,7 +1241,7 @@ class MarsDataProfiler(MarsBaseEstimator):
 
         # 计算全量 PSI
         psi_total = (
-            unique_bins_skel
+            filtered_skel  # [修改] 使用过滤后的骨架
             .join(global_actual, on=[feat_col, "bin_id"], how="left")
             .join(expected, on=[feat_col, "bin_id"], how="left")
             .with_columns([

@@ -3,12 +3,12 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# --- 虚拟环境 (不要上传环境库) ---
+# --- 虚拟环境 ---
 venv/
 .venv/
 mars_env/
 
-# --- IDE 配置 (不要上传编辑器设置) ---
+# --- IDE 配置 ---
 .idea/
 .vscode/
 .DS_Store
@@ -20,8 +20,6 @@ build/
 
 # --- 数据与隐私 ---
 *.csv
-*.xlsx
-*.xls
 *.parquet
 *.pkl
 data/
