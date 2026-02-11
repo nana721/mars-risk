@@ -1,3 +1,5 @@
+# mars/analysis/profiler.py
+
 import dataclasses
 from typing import List, Union, Optional, Any, Dict, Literal
 from concurrent.futures import ThreadPoolExecutor
@@ -65,7 +67,7 @@ class MarsDataProfiler(MarsBaseEstimator):
     >>> report.show_overview()
 
     >>> # 2. 高级用法：自定义缺失值 + 按月分组 + 关闭画图(提速)
-    >>> profiler = MarsDataProfiler(df, custom_missing_values=[-999, "unknown"])
+    >>> profiler = MarsDataProfiler(df, missing_values=[-999, "unknown"])
     >>> report = profiler.generate_profile(
     ...     profile_by="month",
     ...     config_overrides={"enable_sparkline": False, "stat_metrics": ["psi", "mean", "min", "max"]}
@@ -80,8 +82,8 @@ class MarsDataProfiler(MarsBaseEstimator):
         exclude_features: Optional[List[str]] = None,
         include_dtypes: Union[type, pl.DataType, List[Union[type, pl.DataType]], None] = None,
         
-        custom_missing_values: Optional[List[Union[int, float, str]]] = None,
-        custom_special_values: Optional[List[Any]] = None,
+        missing_values: Optional[List[Union[int, float, str]]] = None,
+        special_values: Optional[List[Any]] = None,
         
         overview_batch_size: int = 500,  
         
@@ -107,9 +109,9 @@ class MarsDataProfiler(MarsBaseEstimator):
         include_dtypes : List[pl.DataType], optional
             [类型白名单] 仅包含指定数据类型的列进行分析。
             - 支持 Python 原生类型和 Polars 类型。例如: [int, pl.Int64, pl.Float64] 只分析数值列。
-        custom_missing_values : List[Union[int, float, str]], optional
+        missing_values : List[Union[int, float, str]], optional
             指定自定义缺失值列表。例如: [-999, "unknown", "\\N"]。
-        custom_special_values : List[Any], optional
+        special_values : List[Any], optional
             指定自定义特殊值列表 (如极端值)。这些值在计算分布图时会被单独处理。
         psi_batch_size : int, optional
             计算 PSI 时的特征批处理大小。默认为 50。
@@ -137,8 +139,8 @@ class MarsDataProfiler(MarsBaseEstimator):
         self.config = config if config else MarsProfileConfig()
         
         # 值处理配置
-        self.custom_missing = custom_missing_values if custom_missing_values else []
-        self.special_values = custom_special_values if custom_special_values else []
+        self.custom_missing = missing_values if missing_values else []
+        self.special_values = special_values if special_values else []
         
         # PSI 配置
         self.psi_batch_size = psi_batch_size
@@ -147,26 +149,25 @@ class MarsDataProfiler(MarsBaseEstimator):
         self.psi_cv_ignore_threshold = psi_cv_ignore_threshold
 
         # 特征筛选逻辑 
-        # Step A: 初始范围
+        # 初始范围
         candidates = features if features else self.df.columns
             
-        # Step B: 黑名单剔除
+        # 黑名单剔除
         if exclude_features:
             exclude_set = set(exclude_features)
             candidates = [c for c in candidates if c not in exclude_set]
 
-        # Step C: 类型白名单 (支持 Python原生类型 + Polars类型)
-        # ---------------------------------------------------------
+        # 类型白名单 (支持 Python原生类型 + Polars类型)
         if include_dtypes:
             import polars.selectors as cs
             
-            # 1. 归一化为列表
+            # 归一化为列表
             if not isinstance(include_dtypes, list):
                 raw_dtypes = [include_dtypes]
             else:
                 raw_dtypes = include_dtypes
             
-            # 2. 类型映射：Python Type -> Polars Abstract Type
+            # 类型映射：Python Type -> Polars Abstract Type
             target_dtypes = []
             for t in raw_dtypes:
                 # --- Python Native Mapping ---
@@ -184,7 +185,7 @@ class MarsDataProfiler(MarsBaseEstimator):
                 else:
                     target_dtypes.append(t)
             
-            # 3. 智能选择
+            # 智能选择
             try:
                 # 利用 Selectors 进行宽容匹配
                 dtype_selector = cs.by_dtype(target_dtypes)
@@ -282,12 +283,12 @@ class MarsDataProfiler(MarsBaseEstimator):
         >>> # 示例: 筛选出缺失率 > 90% 的特征列表
         >>> high_missing_cols = overview.filter(pl.col("missing_rate") > 0.9)["feature"].to_list()
         """
-        # 1. 动态配置合并
+        # 动态配置合并
         run_config: MarsProfileConfig = self.config
         if config_overrides:
             run_config = dataclasses.replace(self.config, **config_overrides)
 
-        # 2. 构建分析上下文, 决定本次运行使用的数据集 (working_df) 和 分组列 (group_col)
+        # 构建分析上下文, 决定本次运行使用的数据集 (working_df) 和 分组列 (group_col)
         working_df = self.df
         group_col = profile_by
 
@@ -296,9 +297,6 @@ class MarsDataProfiler(MarsBaseEstimator):
             if dt_col not in self.df.columns:
                 raise ValueError(f"dt_col '{dt_col}' not found in DataFrame.")
             
-            # 调用 MarsDate 工具类生成 Polars 表达式
-            # 无论 dt_col 是 "20230101"(str), 20230101(int) 还是 "2023/01/01"
-            # MarsDate 都能通过 smart_parse_expr 自动处理并截断
             if profile_by == "day":
                 date_expr = MarsDate.dt2day(dt_col)
             elif profile_by == "week":
@@ -322,19 +320,19 @@ class MarsDataProfiler(MarsBaseEstimator):
             if profile_by not in self.df.columns:
                 raise ValueError(f"Column '{profile_by}' not found. Did you forget to set `dt_col`?")
         
-        # 3. 计算全量概览 (Overview) 
+        # 计算全量概览 (Overview) 
         #    Overview 总是基于原始 self.df (或 working_df，不影响结果)
         overview_df: pl.DataFrame = self._calculate_overview(run_config)
 
-        # 4. 计算趋势表 (Trend Tables)
+        # 计算趋势表 (Trend Tables)
         #    必须传入 context_df=working_df，因为它包含了可能新生成的 group_col
         dq_tables: Dict[str, pl.DataFrame] = {}
         
-        # 4.1 DQ Trends
+        ## DQ Trends
         for m in run_config.dq_metrics:
             dq_tables[m] = self._generate_pivot_report(m, group_col, context_df=working_df)
 
-        # 4.2 Stats Trends
+        ## Stats Trends
         stat_tables: Dict[str, pl.DataFrame] = {}
         for m in run_config.stat_metrics:
             # a. Pivot
@@ -344,7 +342,7 @@ class MarsDataProfiler(MarsBaseEstimator):
                 pivot = self._add_stability_metrics(pivot, exclude_cols=["feature", "dtype", "total"])
             stat_tables[m] = pivot
             
-        # 4.3 PSI Trend
+        ## PSI Trend
         if group_col and ("psi" in run_config.stat_metrics):
             try:
                 # 传入 working_df 以支持临时时间列
@@ -360,9 +358,6 @@ class MarsDataProfiler(MarsBaseEstimator):
             stats_tables=self._format_output(stat_tables)
         )
         
-    # ==========================================================================
-    # Overview Pipeline 
-    # ==========================================================================
     def _calculate_overview(self, config: MarsProfileConfig) -> pl.DataFrame:
         """
         [Internal] 计算全量概览大宽表 (Overview Table)。
@@ -377,27 +372,32 @@ class MarsDataProfiler(MarsBaseEstimator):
 
         Returns
         -------
+        Returns
+        -------
         pl.DataFrame
-            概览宽表。
-            - Index: feature (特征名)
-            - Columns: dtype, distribution, missing_rate, top1_value, mean, ...
+            包含所有特征统计指标的宽表。
+            Schema:
+            - feature: str (Key)
+            - dtype: str
+            - [dq_metrics]: missing_rate, zeros_rate, ... (from config.dq_metrics)
+            - [stat_metrics]: mean, std, p25, ... (from config.stat_metrics)
         """
         cols = self.features
         
-        # 1. 向量化计算所有基础指标
+        # 向量化计算所有基础指标
         stats: pl.DataFrame = self._analyze_cols_vectorized(cols, config)
         
-        # 2. 拼接 dtype 信息
+        # 拼接 dtype 信息
         dtype_df: pl.DataFrame = self._get_feature_dtypes()
         stats = stats.join(dtype_df, on="feature", how="left")
         
-        # 3. 计算迷你分布图 (Sparklines)
+        # 计算迷你分布图 (Sparklines)
         if config.enable_sparkline:
             sparkline_df: pl.DataFrame = self._compute_all_sparklines(cols, config)
             if not sparkline_df.is_empty():
                 stats = stats.join(sparkline_df, on="feature", how="left")
         
-        # 4. 显式指定列顺序：Feature -> Dtype -> Distribution -> DQ -> Stats
+        # 显式指定列顺序：Feature -> Dtype -> Distribution -> DQ -> Stats
         ideal_order: List[str] = [
             "feature", "dtype", 
             "distribution",  
@@ -405,7 +405,7 @@ class MarsDataProfiler(MarsBaseEstimator):
             "top1_ratio", "top1_value"
         ] + config.stat_metrics
         
-        # 容错：只选择实际存在的列并保持 ideal_order 的顺序
+        # 只选择实际存在的列并保持 ideal_order 的顺序
         final_cols: List[str] = []
         seen = set()
         for c in ideal_order:
@@ -466,12 +466,12 @@ class MarsDataProfiler(MarsBaseEstimator):
         # 获取批次大小配置
         batch_size = self.overview_batch_size
 
-        # 1. 开启批次迭代
+        # 开启批次迭代
         for i in range(0, len(cols), batch_size):
             batch_cols = cols[i : i + batch_size]
             all_exprs = []
             
-            # 2. 构建当前批次的表达式池
+            # 构建当前批次的表达式池
             for col in batch_cols:
                 # 获取该列在 Config 下的所有基础指标表达式
                 base_exprs = self._build_expressions(col, cfg)
@@ -481,14 +481,14 @@ class MarsDataProfiler(MarsBaseEstimator):
                     # 使用 ::: 作为分隔符编码元数据，便于后续解析
                     all_exprs.append(expr.alias(f"{col}:::{metric_name}"))
 
-            # 3. 执行批次聚合 (计算 1 行结果)
+            # 执行批次聚合 (计算 1 行结果)
             batch_raw = self.df.select(all_exprs)
             
-            # 4. 立即执行 Reshape 操作，释放内存并降维
+            # 立即执行 Reshape 操作，释放内存并降维
             # unpivot: [1 row x (Batch * Metrics) cols] -> [(Batch * Metrics) rows x 2 cols]
             batch_long = batch_raw.unpivot(variable_name="temp_id", value_name="value")
             
-            # 5. 解析编码在 temp_id 中的特征名和指标名
+            # 解析编码在 temp_id 中的特征名和指标名
             batch_pivoted = (
                 batch_long
                 .with_columns(
@@ -503,10 +503,9 @@ class MarsDataProfiler(MarsBaseEstimator):
             )
             all_batches.append(batch_pivoted)
 
-        # 6. 垂直合并所有批次的结果集
         pivoted = pl.concat(all_batches)
         
-        # 7. 类型标准化：将指标列统一转为 Float64
+        # 类型标准化：将指标列统一转为 Float64
         # 排除 feature (String) 和 top1_value (Mixed String)
         cols_to_cast = [c for c in pivoted.columns if c not in ["feature", "top1_value"]]
         
@@ -552,7 +551,7 @@ class MarsDataProfiler(MarsBaseEstimator):
         pl.DataFrame
             包含 [feature, distribution] 的两列 DataFrame。
         """
-        # 1. 筛选数值列 (非数值列无法画分布图)
+        # 筛选数值列 (非数值列无法画分布图)
         num_cols: List[str] = [c for c in cols if self._is_numeric(c)]
         if not num_cols:
             return pl.DataFrame(
@@ -560,7 +559,7 @@ class MarsDataProfiler(MarsBaseEstimator):
                 schema={"feature": pl.String, "distribution": pl.String}
             )
 
-        # 2. 采样 (Sampling)
+        # 采样
         limit_n = config.sparkline_sample_size
         df_subset = self.df.select(num_cols)
         if df_subset.height > limit_n:
@@ -572,7 +571,7 @@ class MarsDataProfiler(MarsBaseEstimator):
         bars = ['_', '\u2582', '\u2583', '\u2584', '\u2585', '\u2586', '\u2587', '\u2588']
         n_bins: int = config.sparkline_bins
 
-        # 3. 单列处理函数 
+        # 单列处理函数
         def _process_column(col: str) -> Dict[str, str]:
             dist_str: str = "-" 
             try:
@@ -580,7 +579,6 @@ class MarsDataProfiler(MarsBaseEstimator):
                 exclude_vals = self._get_values_to_exclude(col)
                 target_s: pl.Series = sample_df[col]
                 
-                # --- A. 数据清洗 ---
                 if target_s.dtype in [pl.Float32, pl.Float64]:
                     target_s = target_s.filter(target_s.is_not_nan())
                 
@@ -589,17 +587,16 @@ class MarsDataProfiler(MarsBaseEstimator):
                 
                 s: pl.Series = target_s.drop_nulls()
                 
-                # --- B. 边界检查 ---
+               # 边界检查
                 if s.len() == 0:
                     dist_str = "_" * n_bins 
                 elif s.len() == 1 or s.min() == s.max():
                     dist_str = "____█____" 
                 else:
-                    # --- C. 核心计算 (Polars Hist) ---
                     hist_df: pl.DataFrame = s.hist(bin_count=n_bins)
                     counts: List[int] = hist_df.get_column(hist_df.columns[-1]).to_list()
                     
-                    # --- D. 字符映射算法 ---
+                    # 字符映射
                     max_count = max(counts)
                     if max_count == 0:
                         dist_str = "_" * n_bins
@@ -620,7 +617,6 @@ class MarsDataProfiler(MarsBaseEstimator):
                 
             return {"feature": col, "distribution": dist_str}
 
-        # 4. 多核并发执行
         with ThreadPoolExecutor(max_workers=pl.thread_pool_size()-1) as executor:
             results = list(executor.map(_process_column, num_cols))
 
@@ -629,9 +625,6 @@ class MarsDataProfiler(MarsBaseEstimator):
             schema={"feature": pl.String, "distribution": pl.String}
         )
         
-    # ==========================================================================
-    # Trends & Pivot Pipeline 
-    # ==========================================================================
     def _generate_pivot_report(
         self, metric: str, 
         group_col: Optional[str], 
@@ -679,21 +672,21 @@ class MarsDataProfiler(MarsBaseEstimator):
         if not target_cols: 
             return pl.DataFrame()
 
-        # 1. 计算 Total 列 (全局聚合)
+        # 计算 Total 列 (全局聚合)
         total_exprs = [self._get_single_metric_expr(c, metric).alias(c) for c in target_cols]
         total_row = target_df.select(total_exprs)
         # Transpose: [1, n_feats] -> [n_feats, 1]
         total_df = total_row.transpose(include_header=True, header_name="feature", column_names=["total"])
 
-        # 2. 准备基础表 (feature + dtype + total)
+        # 准备基础表 (feature + dtype + total)
         dtype_df = self._get_feature_dtypes()
         base_df = total_df.join(dtype_df, on="feature", how="left")
         
-        # Case A: 没有分组 -> 直接返回 Total 表
+        # 没有分组 -> 直接返回 Total 表
         if group_col is None:
             return base_df.select(["feature", "dtype", "total"]).sort(["dtype", "feature"])
 
-        # Case B: 有分组 -> 计算 Pivot 并 Join
+        # 有分组 -> 计算 Pivot 并 Join
         agg_exprs = [self._get_single_metric_expr(c, metric).alias(c) for c in target_cols]
         # GroupBy -> Agg -> Sort
         #   结果形状: M个分组 x N个特征
@@ -711,11 +704,10 @@ class MarsDataProfiler(MarsBaseEstimator):
         #   age     | 25     | 26
         #   income  | 10000  | 12000
         pivot_df = grouped.transpose(include_header=True, header_name="feature", column_names=group_col)
-
-        # 3. Join Together
+        
         result = base_df.join(pivot_df, on="feature", how="left")
         
-        # 4. 调整列顺序: feature, dtype, ...groups..., total
+        # 调整列顺序: feature, dtype, ...groups..., total
         fixed = {"feature", "dtype", "total"}
         groups = [c for c in result.columns if c not in fixed]
         final_order = ["feature", "dtype"] + groups + ["total"]
@@ -770,9 +762,6 @@ class MarsDataProfiler(MarsBaseEstimator):
             .select(["feature", "dtype"] + calc_cols + ["total", "group_mean", "group_var", "group_cv"])
         )
         
-    # ==========================================================================
-    # PSI Pipeline
-    # ==========================================================================
     @time_it
     def _get_psi_trend(
         self, 
@@ -833,12 +822,9 @@ class MarsDataProfiler(MarsBaseEstimator):
         """
         target_df: pl.DataFrame = context_df if context_df is not None else self.df
         
-        # ==============================================================================
-        # 🛡️ [新增] 内存保护熔断机制 (Sanity Check)
-        # ==============================================================================
+        # 内存保护熔断机制
         # PSI 矩阵是通过 Cross Join 生成骨架的。
         # 如果 group_col 误传了高基数主键(如 user_id)，会导致 (N_feat * N_bins * N_users) 的内存爆炸。
-        # 设定一个安全阈值，例如 1000 (足以覆盖几十年的月份或常用的 Segment)
         MAX_PSI_GROUPS = 1000  
         
         # 快速检查分组数量 (使用 approx_n_unique 极速估算，或者直接 count unique)
@@ -849,9 +835,8 @@ class MarsDataProfiler(MarsBaseEstimator):
             logger.error(f"   Threshold is {MAX_PSI_GROUPS}. Did you accidentally group by an ID column?")
             # 返回空表，避免程序 Crash，让报告其他部分能正常生成
             return pl.DataFrame()
-        # ==============================================================================
         
-        # 1. 确定计算范围
+        # 确定计算范围
         candidates = features if features else self.features
         candidates = [c for c in candidates if c != group_col]
         
@@ -874,15 +859,13 @@ class MarsDataProfiler(MarsBaseEstimator):
         inc_special = self.config.psi_include_special
         
         BATCH_SIZE = self.psi_batch_size 
-        # ==============================================================================
-        # 🟢 路一：数值特征 PSI 
-        # ==============================================================================
+        
+        # 数值特征 PSI 
         if num_cols:
             try:
                 numeric_missing = [v for v in self.custom_missing if isinstance(v, (int, float)) and not isinstance(v, bool)]
                 numeric_special = [v for v in self.special_values if isinstance(v, (int, float)) and not isinstance(v, bool)]
                 
-                # 1. Fit Global
                 binner = MarsNativeBinner(
                     features=num_cols,
                     method=self.psi_bin_method, 
@@ -899,28 +882,21 @@ class MarsDataProfiler(MarsBaseEstimator):
                     possible_bins.extend([-3 - i for i in range(len(numeric_special))])
                 b_ids = pl.DataFrame({"bin_id": possible_bins}, schema={"bin_id": pl.Int16})
 
-                # 2. 分批处理 Loop
+                # 分批处理 Loop
                 for i in range(0, len(num_cols), BATCH_SIZE):
                     batch_cols = num_cols[i : i + BATCH_SIZE]
-                    
-                    # --- Local Scope Start ---
-                    
-                    # A. Transform (Input: Eager, Output: Lazy)
                     cols_needed = batch_cols + [group_col]
                     
                     # 这里直接传入 Eager DataFrame Slice
                     # Polars 的 select 是零拷贝的，不会复制数据，所以这里很快且内存安全
                     df_batch_input = target_df.select(cols_needed)
-                    
-                    # 开启 lazy=True，让 transform 内部转为 lazy 模式执行逻辑，避免生成巨大的中间结果矩阵
                     lf_binned: pl.LazyFrame = binner.transform(df_batch_input, return_type='index', lazy=True)
                     
-                    # B. 构建当前批次的 Rename Map
+                    # 构建当前批次的 Rename Map
                     feat_map_batch = {idx: name for idx, name in enumerate(batch_cols)}
                     bin_cols_batch = [f"{c}_bin" for c in batch_cols]
                     rename_map = {old: str(idx) for idx, old in enumerate(bin_cols_batch)}
                     
-                    # C. [修改] 去掉 .collect()，保持为 LazyFrame
                     lf_agg_stats_batch = (
                         lf_binned
                         .rename(rename_map)
@@ -939,25 +915,23 @@ class MarsDataProfiler(MarsBaseEstimator):
                         .len()  # 此时返回的是 LazyFrame
                     )
 
-                    # D. [修改] 骨架构建也改为 Lazy (去掉 Eager 的 DataFrame 创建)
                     lf_f_ids = pl.LazyFrame({"feat_idx": list(feat_map_batch.keys())}, schema={"feat_idx": pl.Int16})
-                    lf_b_ids = b_ids.lazy() # 假设之前的 b_ids 是 eager 的，转为 lazy
+                    lf_b_ids = b_ids.lazy() 
                     lf_unique_bins_skel = lf_f_ids.join(lf_b_ids, how="cross")
 
-                    # E. [调用] 传入 LazyFrame，得到 LazyFrame 结果
+                    # 传入 LazyFrame，得到 LazyFrame 结果
                     # 注意：这里我们不再传入 skeleton，让 _calc_psi_from_stats 内部自己生成完整的 [分组x特征x分箱] 骨架
                     lf_psi_num_raw = self._calc_psi_from_stats(
                         stats_df=lf_agg_stats_batch, 
                         unique_bins_skel=lf_unique_bins_skel, 
                         group_col=group_col, 
                         baseline_group=baseline_group,
-                        # [新增] 传入数值型的标记
                         is_numeric_bin_id=True, 
                         include_missing=inc_missing,
                         include_special=inc_special
                     )
 
-                    # F. [还原] 保持 Lazy 链条
+                    # [还原] 保持 Lazy 链条
                     mapping_df = pl.LazyFrame({
                         "feat_idx": list(feat_map_batch.keys()),
                         "feature": list(feat_map_batch.values())
@@ -971,17 +945,14 @@ class MarsDataProfiler(MarsBaseEstimator):
                     )
                     
                     psi_result_parts.append(psi_num_final)
-                    # --- Local Scope End ---
 
             except Exception as e:
                 logger.error(f"Numeric PSI failed: {e}")
 
-        # ==============================================================================
-        # 🟡 路二：类别特征 PSI 
-        # ==============================================================================
+        # 路二：类别特征 PSI 
         if cat_cols:
             try:
-                # 1. 构建聚合统计 LazyFrame (不 collect)
+                #  构建聚合统计 LazyFrame (不 collect)
                 lf_long_cat: pl.LazyFrame = (
                     target_df.lazy()
                     .select(cat_cols + [group_col])
@@ -998,23 +969,22 @@ class MarsDataProfiler(MarsBaseEstimator):
                     .len()
                 )
 
-                # 2. 生成 [特征 x 类别] 的唯一组合骨架 (Lazy)
+                # 生成 [特征 x 类别] 的唯一组合骨架 (Lazy)
                 lf_unique_bins_cat = lf_long_cat.select(["feature", "bin_id"]).unique()
 
-                # 3. 调用重构后的计算函数 (传入 LazyFrame)
+                # 调用重构后的计算函数 (传入 LazyFrame)
                 # 注意：由于我们优化了 _calc_psi_from_stats，不再需要手动传入 skeleton_cat
                 lf_psi_cat_raw = self._calc_psi_from_stats(
                     stats_df=lf_long_cat, 
                     unique_bins_skel=lf_unique_bins_cat, 
                     group_col=group_col, 
                     baseline_group=baseline_group,
-                    # [新增] 传入类别型的标记
                     is_numeric_bin_id=False,
                     include_missing=inc_missing,
                     include_special=inc_special
                 )
 
-                # 4. 执行并存入结果集
+                # 执行并存入结果集
                 # 在这里进行 collect 是为了将结果存入 list，方便最后的 pl.concat
                 psi_cat_final = (
                     lf_psi_cat_raw
@@ -1026,9 +996,6 @@ class MarsDataProfiler(MarsBaseEstimator):
             except Exception as e:
                 logger.error(f"Categorical PSI failed: {e}")
 
-        # ==============================================================================
-        # 🏁 合并与整形
-        # ==============================================================================
         if not psi_result_parts:
             return pl.DataFrame()
 
@@ -1083,7 +1050,6 @@ class MarsDataProfiler(MarsBaseEstimator):
         unique_bins_skel: pl.LazyFrame, 
         group_col: str, 
         baseline_group: Any,
-        # [新增参数]
         is_numeric_bin_id: bool = True,
         include_missing: bool = True,
         include_special: bool = True
@@ -1134,17 +1100,12 @@ class MarsDataProfiler(MarsBaseEstimator):
         epsilon = 1e-6
         div_safe = 1e-9  # 防止分母为 0 的保险系数
 
-        # ======================================================================
-        # [新增] 1. 动态过滤逻辑 (Filtering Logic)
-        # ======================================================================
         # 在计算占比之前，先剔除不需要参与 PSI 计算的箱。
         # 这样 sum().over() 的分母会自动变成 "剔除后的总样本量"。
-        
         filter_cond = pl.lit(True)
-
         if is_numeric_bin_id:
             # --- 数值型逻辑 (基于 Int 索引) ---
-            # 约定: Missing=-1, Special <= -3, Normal >= 0, Other=-2(通常算作正常分布的一部分)
+            # 约定: Missing=-1, Special <= -3, Normal >= 0, Other=-2
             
             if not include_missing:
                 # 剔除 -1 (IDX_MISSING)
@@ -1168,7 +1129,6 @@ class MarsDataProfiler(MarsBaseEstimator):
                 special_str_list = [str(v) for v in self.special_values]
                 filter_cond &= (~pl.col("bin_id").is_in(special_str_list))
 
-        # 应用过滤
         # 注意: 这里的 filtered_stats 仅包含被选中的箱子
         filtered_stats = stats_df.filter(filter_cond)
         
@@ -1176,16 +1136,12 @@ class MarsDataProfiler(MarsBaseEstimator):
         # 导致分母不一致或 PSI 计算错误
         filtered_skel = unique_bins_skel.filter(filter_cond)
 
-        # ======================================================================
-        # 2. 自动生成完整的 [分组 x 特征 x 分箱] 骨架
-        # ======================================================================
-        # [修改] 使用 filtered_stats 获取 unique_groups，确保只处理剩下的数据
+        # 自动生成完整的 [分组 x 特征 x 分箱] 骨架
+        # 使用 filtered_stats 获取 unique_groups，确保只处理剩下的数据
         unique_groups = filtered_stats.select(group_col).unique()
         full_skeleton = filtered_skel.join(unique_groups, how="cross")
 
-        # ======================================================================
-        # 3. 计算基准分布 (Expected) - E
-        # ======================================================================
+        # 计算基准分布 (Expected) - E
         # [注意] 此时的分母 sum("len") 已经是剔除后的总数了
         expected = (
             filtered_stats
@@ -1196,9 +1152,7 @@ class MarsDataProfiler(MarsBaseEstimator):
             .select([feat_col, "bin_id", "E"])
         )
 
-        # ======================================================================
-        # 4. 计算实际分布 (Actual) - A
-        # ======================================================================
+        # 计算实际分布 (Actual) - A
         actual = (
             filtered_stats
             .with_columns(
@@ -1207,9 +1161,7 @@ class MarsDataProfiler(MarsBaseEstimator):
             .select([group_col, feat_col, "bin_id", "A"])
         )
 
-        # ======================================================================
-        # 5. 计算全量分布 (Global Actual) - A_global
-        # ======================================================================
+        # 计算全量分布 (Global Actual) - A_global
         global_actual = (
             filtered_stats
             .group_by([feat_col, "bin_id"])
@@ -1220,9 +1172,6 @@ class MarsDataProfiler(MarsBaseEstimator):
             .select([feat_col, "bin_id", "A_global"])
         )
 
-        # ======================================================================
-        # 6. 核心 PSI 聚合
-        # ======================================================================
         # 计算分组 PSI
         psi_group = (
             full_skeleton
@@ -1241,7 +1190,7 @@ class MarsDataProfiler(MarsBaseEstimator):
 
         # 计算全量 PSI
         psi_total = (
-            filtered_skel  # [修改] 使用过滤后的骨架
+            filtered_skel 
             .join(global_actual, on=[feat_col, "bin_id"], how="left")
             .join(expected, on=[feat_col, "bin_id"], how="left")
             .with_columns([
@@ -1258,9 +1207,6 @@ class MarsDataProfiler(MarsBaseEstimator):
         return psi_group.join(psi_total, on=feat_col, how="left")
 
 
-    # =========================================================================
-    # Expression Factories 
-    # =========================================================================
     def _build_expressions(self, col: str, config: MarsProfileConfig) -> List[pl.Expr]:
         """[Factory] 为单个列生成所有 Overview 指标的计算表达式。"""
         return self._get_full_stats_exprs(col, config)
@@ -1294,7 +1240,7 @@ class MarsDataProfiler(MarsBaseEstimator):
         dq_targets = config.dq_metrics
         
         if "missing" in dq_targets:
-            # [核心修复] 构建 联合缺失条件: 原生 Null | (如果是数值则包含 NaN) | 自定义缺失值
+            # 构建 联合缺失条件: 原生 Null | (如果是数值则包含 NaN) | 自定义缺失值
             missing_cond = pl.col(col).is_null()
             if is_num:
                 missing_cond |= pl.col(col).is_nan()
@@ -1393,20 +1339,17 @@ class MarsDataProfiler(MarsBaseEstimator):
         pl.Expr
             Polars 表达式对象。
         """
-        # 1. 获取该列对应的特殊值/缺失值列表
         valid_missing = self._get_valid_missing(col)
         
-        # 2. 定义基础列对象 (Raw Data)
+        # 定义基础列对象 (Raw Data)
         raw_col = pl.col(col)
         is_num = self._is_numeric(col)
         col_dtype = self._dtype_map.get(col)
 
-        # ---------------------------------------------------------
-        # Group A: 数据质量指标 (基于 Raw Data 计算)
-        # ---------------------------------------------------------
+        # 数据质量指标 (基于 Raw Data 计算)
         if metric_type == "missing":
             # 缺失率 = (原生 Null + NaN + 自定义特殊值) / 总行数
-            # [修改] 增加对 NaN 的判定，因为 np.nan 在 Polars 中被识别为 NaN
+            # 增加对 NaN 的判定，因为 np.nan 在 Polars 中被识别为 NaN
             missing_cond = raw_col.is_null()
             if is_num and col_dtype in [pl.Float32, pl.Float64]:
                 missing_cond |= raw_col.is_nan()
@@ -1428,10 +1371,7 @@ class MarsDataProfiler(MarsBaseEstimator):
             # 众数占比 (特殊值也可能成为众数，需暴露风险)
             return raw_col.value_counts(sort=True).first().struct.field("count") / pl.len()
 
-        # ---------------------------------------------------------
-        # Group B: 数值统计指标 (基于 Clean Data 计算)
-        # ---------------------------------------------------------
-            
+        # 数据统计指标 (基于 Clean Data 计算)
         if not is_num: 
             return pl.lit(None)
 
@@ -1447,38 +1387,27 @@ class MarsDataProfiler(MarsBaseEstimator):
         if exclude_vals:
             keep_mask &= ~raw_col.is_in(exclude_vals)
 
-        # 【决策】这里使用 filter，因为后续涉及 quantile/median 计算。
+        # 这里使用 filter，因为后续涉及 quantile/median 计算。
         # filter 会物理减少数据量，这对于排序类操作(Sorting-based ops)性能更优，
         # 且在 generate_profile 中我们只返回标量(Scalar)，不会导致列长度不一致的问题。
         clean_col = raw_col.filter(keep_mask)
 
         mapper = {
-            # 集中度
             "mean": clean_col.mean(),
             "median": clean_col.median(),
             "sum": clean_col.sum(),
-            
-            # 离散度
             "std": clean_col.std(),
-            
-            # 极值 (最小值如果是 -999 就没意义了，所以要用 clean_col)
+            # (最小值如果是 -999 就没意义了，所以要用 clean_col)
             "min": clean_col.min(),
             "max": clean_col.max(),
-            
-            # 分位数
             "p25": clean_col.quantile(0.25),
             "p75": clean_col.quantile(0.75),
-            
-            # 分布形态
             "skew": clean_col.skew(),
             "kurtosis": clean_col.kurtosis()
         }
         
         return mapper.get(metric_type, pl.lit(None))
 
-    # ==========================================================================
-    # Helpers & Utilities
-    # ==========================================================================
     def _get_feature_dtypes(self) -> pl.DataFrame:
         """[Helper] 获取 Schema 信息表"""
         schema = {"feature": [], "dtype": []}
@@ -1526,7 +1455,6 @@ class MarsDataProfiler(MarsBaseEstimator):
             当前列中应当被视为“非正常数值”的列表。
             列表中的元素类型保证与 `col` 的数据类型兼容 (例如数值列只返回数值，字符串列只返回字符串)。
         """
-        # 1. 合并两个列表 
         # 如果 self.special_values 还没定义，就用空列表代替
         special_vals = getattr(self, "special_values", [])
         candidates = self.custom_missing + special_vals
@@ -1534,11 +1462,10 @@ class MarsDataProfiler(MarsBaseEstimator):
         if not candidates: 
             return []
 
-        # 2. 获取列类型
         is_num = self._is_numeric(col)
         is_str = self.df[col].dtype == pl.String
 
-        # 3. 类型安全过滤
+        # 类型安全过滤
         valid_values = []
         for v in candidates:
             # 只有当 值类型 与 列类型 匹配时，才加入列表

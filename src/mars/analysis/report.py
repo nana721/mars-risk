@@ -1,3 +1,5 @@
+# mars/analysis/report.py
+
 import os
 import sys
 from copy import copy
@@ -177,14 +179,14 @@ class MarsProfileReport:
         ascending : bool, default True
             时间/分组列的排序方式。
         """
-        # 1. 路由逻辑：查找指标属于哪个表
+        # 路由逻辑：查找指标属于哪个表
         source_type = self._metric_index.get(metric)
         if source_type is None:
              # 提供更友好的报错提示
             available = list(self._metric_index.keys())
             raise ValueError(f"❌ Metric '{metric}' not found. Available metrics: {available[:10]}...")
 
-        # 2. 获取数据
+        # 获取数据
         if source_type == "dq":
             df_raw = self.dq_tables[metric]
             # DQ 默认配置
@@ -199,17 +201,15 @@ class MarsProfileReport:
             fmt_pct = False    # 统计值通常是绝对值
             vmin, vmax = None, None
 
-        # 3. 特殊指标微调 (Override)
+        # 特殊指标微调 (Override)
         if metric == "psi":
             cmap = "RdYlGn_r" # PSI 高了是坏事
             fmt_pct = False   # PSI 是数值不是百分比
             vmin, vmax = 0.0, 0.5 # 锚定阈值
         
-        # 4. 转换与排序
         df = self._to_pd(df_raw)
         df = self._reorder_trend_cols(df, ascending)
 
-        # 5. 生成样式
         return self._get_styler(
             df,
             title=f"Trend Analysis: {metric}",

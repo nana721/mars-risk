@@ -1,3 +1,5 @@
+# mars/feature/binner.py
+
 from joblib import Parallel, delayed
 from typing import List, Dict, Optional, Union, Any, Literal, Tuple, Set
 import multiprocessing
@@ -309,7 +311,6 @@ class MarsBinnerBase(MarsTransformer):
         for i in range(0, len(bin_cols_orig), batch_size):
             batch_features = bin_cols_orig[i: i + batch_size]
             
-            # 1. 执行转换
             X_batch_bin: pl.DataFrame = self.transform(
                 self._cache_X.select(batch_features), 
                 return_type="index", 
@@ -317,13 +318,13 @@ class MarsBinnerBase(MarsTransformer):
             )
             X_batch_bin = X_batch_bin.with_columns(y_series)
 
-            # [关键修复]：构造带 _bin 后缀的列名列表
+            # 构造带 _bin 后缀的列名列表
             target_bin_cols = [f"{c}_bin" for c in batch_features]
 
-            # 2. 逆透视 (Unpivot): 确保作用于转换后的索引列
+            # 逆透视 (Unpivot): 确保作用于转换后的索引列
             long_df = X_batch_bin.unpivot(
                 index=[y_name],
-                on=target_bin_cols, # ✅ 修复：使用转换后的索引列名
+                on=target_bin_cols, # 使用转换后的索引列名
                 variable_name="feature_raw", # 临时名称
                 value_name="bin_index"
             ).with_columns(
@@ -352,8 +353,6 @@ class MarsBinnerBase(MarsTransformer):
                 )
             )
 
-           # [优化] 移除 partition_by，改用 Python 字典构建 (与 profile_bin_performance 保持一致)
-            # 这里的 stats_df 是 batch 级别的，数据量不大，但这种写法依然更稳健
             woe_data = stats_df.select(["feature", "bin_index", "woe"]).to_dict(as_series=False)
             
             from collections import defaultdict
@@ -366,7 +365,6 @@ class MarsBinnerBase(MarsTransformer):
             
             self.bin_woes_.update(temp_woe_map)
 
-            # 强制内存断层
             del X_batch_bin, long_df, stats_df
             gc.collect()
 
@@ -604,11 +602,11 @@ class MarsBinnerBase(MarsTransformer):
                     
                     layer_normal = pl.col(f"_idx_{col}")
                 else:
-                    # [修复] 类别型特征的 Replace 逻辑
+                    # 类别型特征的 Replace 逻辑
                     # 1. 显式转 String 确保匹配安全
                     str_map = {k: str(v) for k, v in cat_to_idx.items()}
                     
-                    # 2. [修复] default 必须设为 None (Null)！
+                    # 2.  default 必须设为 None (Null)！
                     #    - 如果设为 IDX_OTHER (-2)，特殊值(如-999)会被提前截获变成 -2，
                     #      导致后续的 Special Logic (current_branch) 无法生效。
                     #    - 设为 None 后，特殊值会穿透变成 Null，从而落入 otherwise(current_branch) 被正确处理。
@@ -651,26 +649,20 @@ class MarsBinnerBase(MarsTransformer):
                 str_map = {str(k): v for k, v in self.bin_mappings_.get(col, {}).items()}
                 exprs.append(final_idx_expr.cast(pl.Utf8).replace(str_map).alias(f"{col}_bin"))
 
-        # 清理 Join 产生的临时列
         return X.with_columns(exprs).drop(temp_join_cols).lazy() if lazy else X.with_columns(exprs).drop(temp_join_cols)
 
     @staticmethod
     def _detect_trend_scientific(woes: List[float]) -> str:
-        """
-        [科学判定] 基于 NumPy 的严格单调性检测。
-        逻辑对齐: optbinning.binning.auto_monotonic.type_of_monotonic_trend
-        """
-        # 1. 清洗与预检
         y = np.array([w for w in woes if w is not None and not np.isnan(w)])
         n = len(y)
         
         if n < 2: 
             return "scanty"
             
-        # 2. 计算差分
+        # 计算差分
         diff = np.diff(y)
         
-        # 3. 严格单调性 (Ascending / Descending)
+        # 严格单调性 (Ascending / Descending)
         if np.all(diff >= 0): 
             return "ascending"
         if np.all(diff <= 0): 
@@ -679,7 +671,7 @@ class MarsBinnerBase(MarsTransformer):
         if n < 3: 
             return "undefined" # 非单调且点数少于3，无法构成峰谷
 
-        # 4. Peak (倒U型)
+        # Peak (倒U型)
         #    Max 必须在中间 (0 < t < n-1)
         t_max = np.argmax(y)
         if 0 < t_max < n - 1:
@@ -687,7 +679,7 @@ class MarsBinnerBase(MarsTransformer):
             if np.all(diff[:t_max] >= 0) and np.all(diff[t_max:] <= 0):
                 return "peak"
 
-        # 5. Valley (U型)
+        # Valley (U型)
         #    Min 必须在中间 (0 < t < n-1)
         t_min = np.argmin(y)
         if 0 < t_min < n - 1:
@@ -726,7 +718,7 @@ class MarsBinnerBase(MarsTransformer):
 
         Notes
         -----
-        **1. 矩阵化聚合l逻辑**
+        **1. 矩阵化聚合逻辑**
             采用“逆透视”将 `(N_rows * M_features)` 的宽表动态转换为长表, Polars 优化器
             可利用单一的查询计划在单次 I/O 扫描中并行计算数千个特征的所有指标。
 
@@ -853,16 +845,11 @@ class MarsBinnerBase(MarsTransformer):
         # 获取最终结果集
         stats_df: pl.DataFrame = lf_stats.drop(["bin_auc_contrib", "_woe_sort_key"]).collect(streaming=True)
         
-        # -------------------------------------------------------------------------
-        # [优化] 移除 partition_by，改用向量化/字典化处理
-        # -------------------------------------------------------------------------
-        
         if update_woe:
-            # 1. 提取需要的列转为 Python 字典列表 (Zero-copy where possible)
+            # 提取需要的列转为 Python 字典列表 (Zero-copy where possible)
             # as_series=False 直接返回 list，迭代速度极快
             woe_data = stats_df.select(["feature", "bin_index", "woe"]).to_dict(as_series=False)
             
-            # 2. 使用 pure python 构建嵌套字典
             from collections import defaultdict
             temp_woe_map = defaultdict(dict)
             
@@ -871,15 +858,9 @@ class MarsBinnerBase(MarsTransformer):
                 # 过滤掉非法的 bin_index (如 Null 或 NaN)
                 if b is not None and not (isinstance(b, float) and np.isnan(b)):
                     temp_woe_map[f][int(b)] = w
-            
-            # 3. 批量更新
             self.bin_woes_.update(temp_woe_map)
-
-        # -------------------------------------------------------------------------
-        # [Label 映射优化] 使用全局 Join 替代逐特征 Replace
-        # -------------------------------------------------------------------------
         
-        # 1. 构建全局 Mapping 宽表转长表
+        # 构建全局 Mapping 宽表转长表
         mapping_rows = []
         for col, map_dict in self.bin_mappings_.items():
             for idx, label in map_dict.items():
@@ -895,7 +876,7 @@ class MarsBinnerBase(MarsTransformer):
             "bin_label": pl.Utf8
         })
 
-        # 2. 通过一次 Join 完成所有 Label 挂载
+        # 通过一次 Join 完成所有 Label 挂载
         final_df = (
             stats_df
             .join(mapping_df, on=["feature", "bin_index"], how="left")
@@ -1171,28 +1152,22 @@ class MarsNativeBinner(MarsBinnerBase):
         # 预处理排除值
         raw_exclude = self.special_values + self.missing_values
         
-        # -------------------------------------------------------------
-        # Step 1: 批量计算 n_unique, 用于路由低基数逻辑
-        # -------------------------------------------------------------
+        # 批量计算 n_unique, 用于路由低基数逻辑
         # 这一步开销很小, Polars 针对数值列的 n_unique 有极速优化
         unique_exprs = []
         for c in cols:
             col_dtype = X.schema[c]
             safe_exclude = self._get_safe_values(col_dtype, raw_exclude)
-            
-            # 【修复】构建联合过滤条件 (Avoid Chained Filter)
-            # 1. 基础: 非 Null
+        
+            # 非 Null
             keep_mask = pl.col(c).is_not_null()
-            
-            # 2. 叠加: 非 NaN (仅浮点)
+            # 非 NaN (仅浮点)
             if col_dtype in [pl.Float32, pl.Float64]:
                 keep_mask &= ~pl.col(c).is_nan()
-            
-            # 3. 叠加: 非特殊值
+            # 非特殊值
             if safe_exclude:
                 keep_mask &= ~pl.col(c).is_in(safe_exclude)
                 
-            # 一次性应用过滤
             target_col = pl.col(c).filter(keep_mask)
             unique_exprs.append(target_col.n_unique().alias(c))
             
@@ -1210,9 +1185,7 @@ class MarsNativeBinner(MarsBinnerBase):
             else:
                 quantile_cols.append(c)
 
-        # -------------------------------------------------------------
-        # Step 2: 处理高基数列 (标准 Quantile 逻辑)
-        # -------------------------------------------------------------
+        # 处理高基数列 (标准 Quantile 逻辑)
         if quantile_cols:
             q_exprs = []
             for c in quantile_cols:
@@ -1264,9 +1237,7 @@ class MarsNativeBinner(MarsBinnerBase):
                     else:
                         self.bin_cuts_[c] = [float('-inf')] + cuts + [float('inf')]
 
-        # -------------------------------------------------------------
-        # Step 3: 处理低基数列 (中点切分优化)
-        # -------------------------------------------------------------
+        # 处理低基数列 (中点切分优化)
         if low_card_cols:
             for c in low_card_cols:
                 safe_exclude = self._get_safe_values(X.schema[c], raw_exclude)
@@ -1496,9 +1467,6 @@ class MarsNativeBinner(MarsBinnerBase):
         3. 线程池调度: Worker 函数并行执行 `DecisionTreeClassifier.fit`。
         4. 汇总结果: 提取树节点阈值, 生成切点并记录异常。
         """
-        
-        # [优化] Polars Series -> Numpy (使用 zero-copy)
-        # y 已经是 pl.Series, 直接 to_numpy 是最快的, 并强制连续内存布局
         y_np = np.ascontiguousarray(y.to_numpy())
         
         if len(y_np) != X.height:
@@ -1537,7 +1505,6 @@ class MarsNativeBinner(MarsBinnerBase):
 
         raw_exclude = self.special_values + self.missing_values
 
-        # [优化] 任务生成器: 移除生成器内部的冗余转换
         def cart_task_gen():
             for c in cols:
                 col_dtype = X.schema[c]

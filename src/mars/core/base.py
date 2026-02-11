@@ -1,3 +1,5 @@
+# mars/core/base.py
+
 from abc import ABC, abstractmethod
 from typing import Any, List, Optional, Union, Literal, Dict
 import re
@@ -278,9 +280,13 @@ class MarsTransformer(MarsBaseEstimator, TransformerMixin, ABC):
     ) -> "MarsTransformer":
         
         # 检查 X 和 y 的索引一致性
-        if isinstance(X, pd.DataFrame) and isinstance(y, pd.Series):
+        if isinstance(X, pd.DataFrame) and isinstance(y, (pd.Series, pd.DataFrame)):
             if not X.index.equals(y.index):
-                logger.warning("X and y have different indices. Polars will align them by position.")
+                raise ValueError(
+                    "CRITICAL: X and y have different indices. "
+                    "Converting to Polars will lose index information leading to row mismatch. "
+                    "Please align indices in Pandas strictly before passing to Mars."
+                )
                 
         X_pl = self._ensure_polars_dataframe(X)
         y_pl = self._ensure_polars_series(y)

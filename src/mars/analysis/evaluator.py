@@ -1,3 +1,5 @@
+# mars/analysis/evaluator.py
+
 from typing import List, Optional, Dict, Union, Any, Tuple, Literal
 from collections import defaultdict
 import inspect
@@ -71,6 +73,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
     def __init__(
         self, 
         target_col: str = "target",
+        *,
         binner: Optional[MarsBinnerBase] = None,
         bining_type: Literal["native", "opt"] = "native",
         **binner_kwargs
@@ -163,7 +166,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
         6. **Audit**: 执行单调性检查 (Spearman) 与逻辑一致性检查 (RiskCorr)。
         """
         
-        # 1. 上下文准备
+        # 上下文准备
         working_df = self._ensure_polars_dataframe(df)
         if benchmark_df is not None:
             benchmark_df = self._ensure_polars_dataframe(benchmark_df)
@@ -173,14 +176,12 @@ class MarsBinEvaluator(MarsBaseEstimator):
         if n_unique < 2:
             logger.warning(f"⚠️ Target '{self.target_col}' has < 2 unique values. Metrics (AUC/KS) may be invalid.")
 
-        # [修改] 统一分组列名逻辑
-        # _prepare_context 现在返回处理后的 df，它一定包含一列叫 "mars_group"
         working_df = self._prepare_context(working_df, profile_by, dt_col)
         
         # 锁定分组列名为常量 "mars_group"
         group_col = self.GROUP_COL_NAME
 
-        # [修改] 自动识别特征列
+        # 自动识别特征列
         # 排除 target, weights, 和刚刚生成的统一 mars_group 列
         exclude_cols = {self.target_col, group_col}
         if weights_col: 
@@ -233,7 +234,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
         logger.debug("🔄 Transforming features to bin indices...")
         df_binned = self.binner.transform(working_df, return_type="index")
         
-        # 2. [Map Phase] 执行全量数据的流式扫描
+        # [Map Phase] 执行全量数据的流式扫描
         # 将宽表 unpivot 后聚合，得到最小粒度统计表 (Group, Feature, Bin, Count, Bad)
         logger.debug("📊 Step 1: Scanning raw data for stats (Single Pass Map)...")
         group_stats_raw = self._agg_basic_stats(
@@ -241,17 +242,17 @@ class MarsBinEvaluator(MarsBaseEstimator):
             batch_size=batch_size 
         )
         
-        # 3. [Reduce Phase A] 补全 WOE 信息
+        # [Reduce Phase A] 补全 WOE 信息
         # 计算 KS/AUC 依赖 WOE 排序。若分箱器无 WOE，利用 group_stats_raw 内存计算，无需扫原表。
         self._ensure_woe_info(group_stats_raw)
 
-        # 4. [Reduce Phase B] 获取 PSI 基准分布
+        # [Reduce Phase B] 获取 PSI 基准分布
         # 获取 Expected Distribution。若无外部基准，取 group_stats_raw 中最早的一组。
         expected_dist = self._get_benchmark_dist(
             group_stats_raw, benchmark_df, group_col, target_features, weights_col
         )
 
-        # 5. [Reduce Phase C] 汇总 Total 统计量
+        # [Reduce Phase C] 汇总 Total 统计量
         # 在内存中将不同 Group 的统计量累加，得到全量数据的分布情况。
         logger.debug("∑  Step 2: Rolling up stats for Total (Reduce)...")
         total_stats_raw = (
@@ -264,10 +265,10 @@ class MarsBinEvaluator(MarsBaseEstimator):
             .with_columns(pl.lit("Total").alias(group_col)) # 显式标记为全量
         )
 
-        # 6. 指标计算 
+        # 指标计算 
         logger.debug("🧮 Step 3: Calculating metrics (PSI/AUC/KS/IV)...")
         
-        # 6.1 计算 Trend 数据
+        # 计算 Trend 数据
         metrics_groups = (
             self._calc_metrics_from_stats(
                 group_stats_raw, expected_dist, group_col,
@@ -278,7 +279,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
             .with_columns(pl.col(group_col).cast(pl.String))
         )
         
-        # 6.2 计算 Total 数据
+        # 计算 Total 数据
         metrics_total = self._calc_metrics_from_stats(
             total_stats_raw, expected_dist, group_col,
             # 传参
@@ -286,7 +287,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
             include_special=psi_include_special
         )
 
-        # 6.3 合并分组与总体结果
+        # 合并分组与总体结果
         metrics_total = metrics_total.select(metrics_groups.columns)
 
         # [BugFix] 防止单点评估模式下出现双重 "Total"
@@ -304,7 +305,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
             # 正常模式（有多组，或者单组但不叫Total）：将 Total 作为汇总行追加到头部
             stats_long = pl.concat([metrics_total, metrics_groups])
 
-        # 7. 单调性检查 (Monotonicity Check)
+        # 单调性检查 (Monotonicity Check)
         # 使用斯皮尔曼相关系数判断分箱索引与坏率的关系是否单调
         logger.debug("📉 Step 4: Checking monotonicity...")
         monotonicity_df = (
@@ -316,7 +317,6 @@ class MarsBinEvaluator(MarsBaseEstimator):
             )
         )
 
-        # 8. 格式化输出：重塑数据为最终 Report 容器
         report = self._format_report(
             stats_long, metrics_groups, metrics_total, group_col, monotonicity_df
         )
@@ -665,11 +665,9 @@ class MarsBinEvaluator(MarsBaseEstimator):
 
         epsilon = 1e-9
         
-        # ======================================================================
-        # [优化] 2. 构建 PSI 专用计算域 (Scope Definition)
-        # ======================================================================
+        # 构建 PSI 专用计算域 
         # 定义哪些箱子参与 PSI 计算
-        # 约定: Missing=-1, Special <= -3, Normal >= 0, Other=-2 (Other通常算正常)
+        # 约定: Missing=-1, Special <= -3, Normal >= 0, Other=-2 
         psi_valid_cond = pl.lit(True)
         
         if not include_missing:
@@ -678,19 +676,15 @@ class MarsBinEvaluator(MarsBaseEstimator):
         if not include_special:
             psi_valid_cond &= (pl.col("bin_index") > -3)
 
-        # ======================================================================
-        # [优化] 3. 计算双套分布 (Dual Distribution Calculation)
-        # ======================================================================
-        
-        # 3.1 全量分布 (用于 IV, BadRate, Lift) - 保持原有逻辑
+        # 计算双套分布
+        # 全量分布 (用于 IV, BadRate, Lift)
         base_df = base_df.with_columns([
             pl.col("count").sum().over([group_col, "feature"]).alias("total_count"),
             pl.col("bad").sum().over([group_col, "feature"]).alias("total_bad"),
             pl.col("good").sum().over([group_col, "feature"]).alias("total_good"),
         ])
         
-        # 3.2 PSI 专用分布 (Re-normalized Distribution)
-        # 利用 filter().sum() 动态计算剔除后的分母
+        # PSI 专用分布
         base_df = base_df.with_columns([
             # 动态计算 Actual 的有效总数
             pl.col("count")
@@ -707,9 +701,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
               .alias("total_expected_dist_psi")
         ])
 
-        # ======================================================================
-        # 4. 指标计算
-        # ======================================================================
+        # 指标计算
         base_df = base_df.with_columns([
             # --- 常规指标 (基于全量) ---
             ((pl.col("count") + epsilon) / (pl.col("total_count") + epsilon)).alias("actual_dist"),
@@ -718,9 +710,9 @@ class MarsBinEvaluator(MarsBaseEstimator):
             (pl.col("bad") / (pl.col("count") + epsilon)).alias("bad_rate"),        
             
             # --- PSI (基于动态归一化) ---
-            # 1. 计算归一化后的 Actual% (只针对有效箱)
+            # 计算归一化后的 Actual% (只针对有效箱)
             (pl.col("count") / (pl.col("total_count_psi") + epsilon)).alias("act_prob_clean"),
-            # 2. 计算归一化后的 Expected% (只针对有效箱)
+            # 计算归一化后的 Expected% (只针对有效箱)
             #    例如：如果剔除缺失值后，剩余 expected_dist 之和为 0.8，则每一项除以 0.8 放大
             (pl.col("expected_dist") / (pl.col("total_expected_dist_psi") + epsilon)).alias("exp_prob_clean")
         ])
@@ -735,7 +727,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
             .otherwise(None)
             .alias("psi_bin"),
             
-            # Lift (通常基于全量)
+            # Lift
             (pl.col("bad_rate") / ((pl.col("total_bad") + epsilon) / (pl.col("total_count") + epsilon))).alias("lift"),
             
             # IV 
@@ -817,12 +809,12 @@ class MarsBinEvaluator(MarsBaseEstimator):
         
         target_col_name = self.GROUP_COL_NAME
         
-        # 1. 智能默认：有时间没分组 -> 默认按月
+        # 有时间没分组 -> 默认按月
         if dt_col and not profile_by:
             logger.info(f"ℹ️ `dt_col` provided without `profile_by`. Defaulting trend to 'month'.")
             profile_by = "month"
 
-        # 2. 处理时间切片 (Day/Week/Month)
+        # 处理时间切片
         if dt_col and profile_by in ["day", "week", "month"]:
             if profile_by == "month":
                 date_expr = MarsDate.dt2month(dt_col)
@@ -834,7 +826,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
             # 直接 alias 为统一列名 "group"
             return df.with_columns(date_expr.alias(target_col_name))
         
-        # 3. 常规分组 (按现有列)
+        # 常规分组：按现有列
         if profile_by:
             if profile_by in df.columns:
                 # 如果该列已经存在，且名字不是 "group"，则复制一份并重命名
@@ -845,8 +837,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
             else:
                 logger.warning(f"⚠️ Column '{profile_by}' not found. Falling back to Snapshot mode.")
 
-        # 4. 兜底逻辑：单点评估 (Snapshot)
-        # 生成一个全为 "Total" 的列，名为 "group"
+        # 兜底逻辑：单点评估
         logger.info(f"ℹ️ Evaluating as a single snapshot ({target_col_name}='Total').")
         return df.with_columns(pl.lit("Total").alias(target_col_name))
 
@@ -924,10 +915,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
         将各项指标（PSI, AUC, KS, IV, BadRate, RiskCorr）以 `feature` 为行，
         `group_col` 为列进行 `Pivot` 转换，生成宽表，用于热力图渲染。
         """
-        # ==============================================================================
-        # Part 1: Detail Table (明细表构造)
-        # ==============================================================================
-        
+        #  Detail Table
         # 映射分箱 Label 
         map_rows = []
         feats = set(stats_long["feature"].unique().to_list())
@@ -935,14 +923,13 @@ class MarsBinEvaluator(MarsBaseEstimator):
         for f, m in self.binner.bin_mappings_.items():
             if f in feats:
                 for i, l in m.items(): 
-                    # [关键修复] 强制将字典 Key 转为 int，防止 JSON 里的字符串 Key 污染类型
+                    # 强制将字典 Key 转为 int，防止 JSON 里的字符串 Key 污染类型
                     try:
                         idx_val = int(i)
                         map_rows.append({"feature": f, "bin_index": idx_val, "bin_label": str(l)})
                     except (ValueError, TypeError):
                         continue 
         
-        # [修复] 显式指定 Schema 为 Int16
         map_schema = {"feature": pl.String, "bin_index": pl.Int16, "bin_label": pl.String}
         
         if map_rows:
@@ -950,28 +937,23 @@ class MarsBinEvaluator(MarsBaseEstimator):
         else:
             map_df = pl.DataFrame([], schema=map_schema)
 
-        # 1. 关联 Label
         # 此时 stats_long 和 map_df 都是 Int16，Join 安全，不会发生类型提升
         detail_base = (
             stats_long
             .join(map_df, on=["feature", "bin_index"], how="left")
             .with_columns(pl.col("bin_label").fill_null(pl.col("bin_index").cast(pl.Utf8)))
         )
-
-        # ==============================================================================
-        # Part 1.5: Trend Shape Injection (计算并注入单调性形状)
-        # ==============================================================================
         
-        # 1. 提取 WOE 序列
+        # 提取 WOE 序列
         trend_source = (
             metrics_total  # 使用 Total 数据
             .lazy()
-            .filter(pl.col("bin_index") >= 0)  # 这里现在是安全的，因为 bin_index 确认为 Int16
+            .filter(pl.col("bin_index") >= 0)  
             .sort(["feature", "bin_index"])
             .select(["feature", "woe"])
         )
         
-        # 2. 调用 Binner 中的静态方法进行判断
+        # 调用 Binner 中的静态方法进行判断
         from mars.feature.binner import MarsBinnerBase 
 
         trend_shape_df = (
@@ -987,11 +969,9 @@ class MarsBinEvaluator(MarsBaseEstimator):
             .select(["feature", "trend"])
             .collect()
         )
-
-        # 3. 将趋势列 Join 回明细基表
         detail_base = detail_base.join(trend_shape_df, on="feature", how="left")
 
-        # 2. [Modified] 构建自定义排序键 (Sort Key)
+        #  构建自定义排序键 (Sort Key)
         # 显式 cast(pl.Int32) 解决 SchemaError
         detail_table = (
             detail_base
@@ -1012,7 +992,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
             .sort(["feature", group_col, "_sort_group", "_sort_idx"]) # 执行物理排序
         )
 
-        # 3. [新增] 计算累积指标 (Cumulative Metrics)
+        #  计算累积指标 
         detail_table = detail_table.with_columns([
             # 累积样本数
             pl.col("count").cum_sum().over(["feature", group_col]).alias("cum_count"),
@@ -1024,7 +1004,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
             # 累积坏账率 = 累积坏 / 累积总
             (pl.col("cum_bad") / (pl.col("cum_count") + 1e-9)).alias("cum_bad_rate"),
             
-            # [新增] 计算箱占比 pct = count / total_count
+            # 计算箱占比 pct = count / total_count
             # total_count 已经在 _calc_metrics_from_stats 中计算并包含在 stats_long 中
             (pl.col("count") / (pl.col("total_count") + 1e-9)).alias("pct"),
             
@@ -1051,9 +1031,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
         
         ])
 
-        # ==============================================================================
-        # 3.5 [新增] 构造 Total 汇总行 (Aggregation for Total Row)
-        # ==============================================================================
+        # 构造 Total 汇总行 )
         # 对每个 (feature, group) 生成一行汇总数据，包含计算后的综合指标
         total_rows = (
             stats_long
@@ -1099,7 +1077,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
             ])
         )
 
-        # [修复] Total 行也要 join trend 列
+        # Total 行也要 join trend 列
         total_rows = total_rows.join(trend_shape_df, on="feature", how="left")
 
         target_cols = [
@@ -1118,7 +1096,6 @@ class MarsBinEvaluator(MarsBaseEstimator):
             .sort(["feature", group_col, "_sort_group", "_sort_idx"])
         )
 
-        # 4. 选择最终输出列
         detail_table = detail_table.select([
             pl.lit(self.target_col).alias("y"),
             "feature", "trend", group_col, "bin_index", "bin_label", 
@@ -1128,11 +1105,8 @@ class MarsBinEvaluator(MarsBaseEstimator):
             "bin_type"
         ])
 
-        # ==============================================================================
-        # Part 2: Intermediate Calculations (中间指标计算)
-        # ==============================================================================
-        
-        # 2.1 RiskCorr (RC) 跨期稳定性逻辑 
+        #  Intermediate Calculations 
+        # RiskCorr (RC) 跨期稳定性逻辑 
         # 确定基准序列 (选取时间最早的一组)
         first_group = metrics_groups.select(pl.col(group_col).min()).item()
         baseline_df = (
@@ -1159,7 +1133,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
             )
         )
 
-        # 2.2 分组指标聚合 (Group Level Aggregation)
+        # 分组指标聚合 
         # 将分箱粒度聚合为分组粒度 (如: Month Level)
         group_level_metrics = (
             metrics_groups
@@ -1176,11 +1150,8 @@ class MarsBinEvaluator(MarsBaseEstimator):
             .join(risk_corr_long, on=["feature", group_col], how="left")
         )
 
-        # ==============================================================================
         # Part 3: Summary Table 
-        # ==============================================================================
-        
-        # 3.1 识别时间窗口 (最近 N 期)
+        # 识别时间窗口 (最近 N 期)
         sorted_groups = metrics_groups.select(pl.col(group_col).unique()).sort(group_col)[group_col].to_list()
         recent_n = 3
         # 如果分组少于3个，则全部视为最近
@@ -1191,29 +1162,20 @@ class MarsBinEvaluator(MarsBaseEstimator):
             pl.col(group_col).is_in(recent_groups).alias("is_recent")
         )
 
-        # 3.2 维度聚合
+        # 维度聚合
         summary_audit = (
             group_stats_enriched
             .group_by("feature")
             .agg([
-                # A. 强度 (Strength) - 均值
                 pl.col("iv").mean().alias("IV_avg"),
                 pl.col("auc").mean().alias("AUC_avg"),
-                
-                # B. 时效 (Recency) - 最近表现
-                # 计算最近 N 期的平均 IV，如果缺失则填 0
                 pl.col("iv").filter(pl.col("is_recent")).mean().fill_null(0).alias("IV_recent"),
-                
-                # C. 稳定性 (Stability) - 漂移监控
                 pl.col("psi").max().alias("PSI_max"),
                 pl.col("psi").mean().alias("PSI_avg"),
-                # 统计有多少期 PSI 超过了 0.1 (轻微漂移警戒线)
                 (pl.col("psi") > 0.1).sum().alias("PSI_alert_cnt"),
-                
-                # D. 逻辑性 (Consistency) - 坏账逻辑
                 pl.col("risk_corr").min().alias("RC_min"),
                 pl.col("risk_corr").mean().alias("RC_avg"),
-                # 统计逻辑反转 (RC < 0) 的次数，这是致命伤
+                # 统计逻辑反转 (RC < 0) 的次数
                 (pl.col("risk_corr") < 0).sum().alias("RC_neg_cnt")
             ])
             .with_columns(
@@ -1223,7 +1185,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
             )
         )
 
-        # 3.3 全量指标聚合 (Total Metrics)
+        # 全量指标聚合
         total_metrics_agg = (
             metrics_total.group_by("feature")
             .agg([
@@ -1236,13 +1198,10 @@ class MarsBinEvaluator(MarsBaseEstimator):
             )
         )
 
-        # 3.4 最终合并与决策生成
         summary_df = (
             summary_audit
             .join(total_metrics_agg, on="feature", how="left")
             .join(monotonicity_df, on="feature", how="left")
-            
-            # --- 核心决策逻辑 (Rule-Based Decision) ---
             .with_columns(
                 pl.when(pl.col("RC_min") < 0.5).then(pl.lit("❌ Drop: Logic Broken"))      
                 .when(pl.col("IV_total") < 0.02).then(pl.lit("🗑️ Drop: Weak Signal"))      
@@ -1251,10 +1210,8 @@ class MarsBinEvaluator(MarsBaseEstimator):
                 .otherwise(pl.lit("✅ Keep: High Quality"))                                
                 .alias("Mars_Decision")
             )
-            # 排序：优先看硬实力(IV_total)，其次看逻辑稳定性
             .sort(["IV_total", "RC_min"], descending=[True, True])
             .with_columns(pl.lit("Float64").alias("dtype"))
-            # 调整下列顺序，把核心指标放前面
             .select([
                 "feature", "Mars_Decision", "IV_total", "IV_recent", "IV_change_pct", 
                 "PSI_max", "PSI_alert_cnt", "RC_min", "RC_neg_cnt", "Monotonicity",
@@ -1262,9 +1219,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
             ])
         )
 
-        # ==============================================================================
-        # Part 4: Trend Tables (趋势透视表)
-        # ==============================================================================
+        # Trend Tables
         trend_tables = {}
         target_metrics = ["psi", "auc", "ks", "iv", "bad_rate", "risk_corr"] 
         
@@ -1345,11 +1300,11 @@ class MarsBinEvaluator(MarsBaseEstimator):
         target_df = None
         target_group_col = None
         
-        # 1. 尝试从 Report 提取绘图所需数据
+        # 尝试从 Report 提取绘图所需数据
         if report is not None:
             target_df = report.detail_table.filter(pl.col("bin_index") != 9999) 
             target_group_col = report.group_col
-        # 2. 尝试从 df_detail 提取数据
+        # 尝试从 df_detail 提取数据
         elif df_detail is not None:
             if isinstance(df_detail, pd.DataFrame):
                 target_df = pl.from_pandas(df_detail).filter(pl.col("bin_index") != 9999)
@@ -1387,322 +1342,18 @@ class MarsBinEvaluator(MarsBaseEstimator):
             ascending=ascending,
             dpi=dpi
         )
-        
-    def evaluate_and_plot(
-        self,
-        # --- 1. Evaluate 阶段核心参数 ---
-        df: Union[pl.DataFrame, pd.DataFrame],
-        features: Optional[List[str]] = None,
-        profile_by: Optional[str] = None,
-        dt_col: Optional[str] = None,
-        target_col: Optional[str] = None, 
-        benchmark_df: Union[pl.DataFrame, pd.DataFrame, None] = None,
-        # [新增参数] 
-        psi_include_missing: bool = False,
-        psi_include_special: bool = False,
-        weights_col: Optional[str] = None,
-        batch_size: int = 500,
-        
-        # --- 2. Binner 策略参数 ---
-        bining_type: Optional[Literal["native", "opt"]] = None, 
-        
-        # --- 3. Plot 阶段核心参数 ---
-        sort_by: str = "iv",       
-        ascending: bool = False,   
-        max_plots: int = 10,       
-        dpi: int = 120,
-        
-        # --- 4. Binner 临时透传参数 ---
-        **kwargs
-    ) -> "MarsEvaluationReport":
-        """
-        [One-Stop Shop] 一站式评估与绘图工作流 (Evaluation & Visualization Pipeline)。
-        
-        该方法封装了 "拟合 -> 转换 -> 评估 -> 绘图" 的完整闭环。它采用了 **上下文管理器 (Context Manager)** 的设计思想，
-        允许用户在不污染实例原始状态的前提下，临时覆盖参数进行快速实验。
-
-
-        Parameters
-        ----------
-        df : Union[pl.DataFrame, pd.DataFrame]
-            待评估的输入数据集 (Train/Test/OOT)。
-        features : List[str], optional
-            指定评估的特征列表。若为 None，自动识别所有可用特征。
-        profile_by : str, optional
-            趋势分析的分组列名 (如 'month', 'vintage')。
-            用于生成时间切片下的 Risk Trend 图表。
-        dt_col : str, optional
-            日期列名。
-            - 若配合 `profile_by='week'`，则按周聚合。
-            - **[智能默认]** 若提供了 `dt_col` 但未提供 `profile_by`，默认为 **'month'** (按月聚合)。
-        target_col : str, optional
-            **[临时覆盖]** 目标变量列名。
-            允许临时指定不同的 Label (如 'is_bad_7d' vs 'is_bad_30d') 进行评估，执行后会自动还原。
-        bining_type : {'native', 'opt'}, optional
-            **[临时覆盖]** 分箱算法策略。
-            - 'native': 极速原生分箱 (Quantile/Uniform)。
-            - 'opt': 最优分箱 (OptBinning)。
-            指定此参数将强制触发重新拟合 (Re-fit)。
-        max_plots : int, default 10
-            **[可视化熔断]**。
-            限制最终生成的图表数量。即使评估了 5000 个特征，也只绘制排序最靠前 (Top-N) 的 N 张图。
-            防止因渲染过多 Canvas 导致 Jupyter Notebook 卡死或内存溢出。
-        sort_by : str, default 'iv'
-            **[绘图筛选器]** 特征排序依据 (Ranking Metric)。
-            决定在生成的报告中优先展示哪些特征的图表。支持四维审计体系的**简写指令**：
-
-            * **强度 (Strength)**:
-                - `'iv'`: 按总信息值排序 (IV_total)。
-                - `'auc'`: 按区分度排序 (AUC_total)。
-                - `'ks'`: 按 KS 统计量排序 (KS_total)。
-            * **逻辑 (Logic)**:
-                - `'rc'` / `'logic'`: 按风险一致性 (RiskCorr) 排序。
-                - *建议配合 `ascending=True` 使用，快速定位逻辑崩坏 (RC<0) 的特征。*
-            * **稳定性 (Stability)**:
-                - `'psi'` / `'drift'`: 按最大漂移幅度 (PSI_max) 排序。
-            * **时效 (Recency)**:
-                - `'decay'` / `'trend'`: 按 IV 衰减率 (IV_change_pct) 排序。
-                - *建议配合 `ascending=True` 使用，快速找出正在失效的特征。*
-            * **综合 (Decision)**:
-                - `'rank'`: 按 Mars 自动化决策评级 (Mars_Decision) 排序。
-
-            同时也支持传入 summary 表中的原始列名，如 `'IV_recent'`, `'PSI_alert_cnt'` 等。
-        ascending : bool, default False
-            排序方向。默认降序 (Descending)，即指标值大的排前面。
-        **kwargs : dict
-            **[分箱器透传参数]**。
-            直接传递给底层的 `MarsNativeBinner` 或 `MarsOptimalBinner`。
-            例如: `n_bins=10`, `min_bin_size=0.05`, `monotonic_trend='ascending'`。
-            注意: 传入任何 kwargs 都会触发分箱器的重新拟合。
-
-        Returns
-        -------
-        MarsEvaluationReport
-            包含汇总表 (Summary)、趋势表 (Trend) 和详情表 (Detail) 的报告容器对象。
-            
-        Examples
-        --------
-        **场景 1: 快速基线评估 (Quick Baseline)**
-        使用默认的 Native 分箱 (Quantile) 快速查看数据概貌。
-
-        >>> evaluator = MarsBinEvaluator(target_col="bad_0")
-        >>> report = evaluator.evaluate_and_plot(
-        ...     df=train_df,
-        ...     profile_by="month",   # 按月查看趋势
-        ...     dt_col="apply_date",
-        ...     max_plots=5           # 只画 IV 最高的前 5 个特征
-        ... )
-
-        **场景 2: 策略 A/B 测试 (精细化最优分箱)**
-        觉得原生分箱不够精细？切换到最优分箱 (OptBinning) 并注入严格的**风控业务约束**。
-        这里展示了如何通过 `kwargs` 透传参数来控制求解器行为。
-
-        >>> # 尝试: 最优分箱 + 强约束
-        >>> # bining_type="opt" 会自动触发重新拟合
-        >>> report_opt = evaluator.evaluate_and_plot(
-        ...     df, 
-        ...     profile_by="month",
-        ...     dt_col="apply_date",
-        ...     bining_type="opt",               # 1. 切换算法
-        ...     # --- 以下参数直接透传给 MarsOptimalBinner ---
-        ...     n_bins=10,                        # 最大分箱数
-        ...     min_bin_size=0.05,               # 最小箱占比 5% 
-        ...     min_bin_n_event=5,               #  每箱至少 5 个坏人
-        ...     prebinning_method="cart",        # 预分箱方法
-        ...     n_prebins=50,                     # 预分箱数
-        ...     min_prebin_size=0.01,            # 预分箱最小占比 1%
-        ...     monotonic_trend="auto_asc_desc", 
-        ...     time_limit=20                    # 单特征求解超时限制 (秒)
-        ... )
-
-        **场景 3: 不同 Label 的快速验证 (Label Shifting)**
-        无需重新实例化，直接测试不同的 Y (如 7天逾期 vs 30天逾期)。
-
-        >>> # 评估 7天逾期
-        >>> evaluator.evaluate_and_plot(df, target_col="is_bad_7d")
-        # -> 触发重置。根据 is_bad_7d 重新计算最优分箱切点，计算 IV。
-
-        >>> # 评估 30天逾期
-        >>> evaluator.evaluate_and_plot(df, target_col="is_bad_30d")
-        # -> 再次触发重置。根据 is_bad_30d 重新计算最优分箱切点，计算 IV。
-
-        **场景 4: 内存受限的大规模计算**
-        处理 5000+ 维宽表时，减小 batch_size 防止 OOM。
-
-        >>> evaluator.evaluate_and_plot(
-        ...     df_huge_wide, 
-        ...     batch_size=100,  # 降低 Map 阶段内存压力
-        ...     max_plots=20     # 只关注 Top 20 核心特征
-        ... )
-        """
-        
-        # ==============================================================================
-        # 0. Context Setup: 状态暂存与环境配置
-        # ==============================================================================
-        # 暂存原始状态，以便在 finally 块中还原，保证函数无副作用 (Side-effect free)
-        original_target = self.target_col
-        original_bining_type = self.bining_type 
-        original_binner_kwargs = self.binner_kwargs.copy() if self.binner_kwargs else {}
-        
-        # 1. 应用临时覆盖: Target
-        if target_col:
-            self.target_col = target_col
-            
-        # 2. 应用临时覆盖: Bining Type (算法策略)
-        if bining_type:
-            self.bining_type = bining_type
-
-        # 3. 处理动态参数 (kwargs) 与强制重置逻辑
-        #  增加 target_col 的判断
-        # 只要发生以下任一情况，都必须抛弃旧的分箱器，重新训练：
-        # 1. 传入了新的分箱参数 (kwargs)
-        # 2. 切换了算法类型 (bining_type)
-        # 3. 切换了目标变量 (target_col) -> 关键！因为最优分箱依赖 Y
-        should_reset_binner = (
-            (kwargs is not None and len(kwargs) > 0) or 
-            (bining_type is not None) or
-            (target_col is not None)  # <--- 新增这行
-        )
-
-        if kwargs:
-            if self.binner_kwargs is None: 
-                self.binner_kwargs = {}
-            self.binner_kwargs.update(kwargs)
-            
-        if should_reset_binner and self.binner is not None:
-            # 增加更详细的日志，告诉用户为什么重置了
-            reason = []
-            if kwargs: 
-                reason.append("params_changed")
-            if bining_type: 
-                reason.append("type_changed")
-            if target_col: 
-                reason.append("target_changed") 
-            
-            logger.info(f"⚡ Context changed ({'+'.join(reason)}). Resetting binner to trigger auto-refit.")
-            self.binner = None
-
-        try:
-            # ==========================================================================
-            # 1. Execution: 执行核心评估计算
-            # ==========================================================================
-            # 调用底层 evaluate 方法，它会处理：
-            # - Auto-Fitting (如果 binner 为 None)
-            # - Transform (分箱映射)
-            # - Aggregation (Map-Reduce 计算指标)
-            report = self.evaluate(
-                df=df,
-                features=features,
-                profile_by=profile_by,
-                dt_col=dt_col,
-                # 传参
-                psi_include_missing=psi_include_missing,
-                psi_include_special=psi_include_special,
-                benchmark_df=benchmark_df,
-                weights_col=weights_col,
-                batch_size=batch_size
-            )
-            
-            # ==========================================================================
-            # 2. Selection: 智能筛选绘图特征 (Top-N 逻辑)
-            # ==========================================================================
-            plot_features = features # 默认回退：全部特征
-            
-            # 获取 Summary 表用于排序
-            summary = report.summary_table
-            # 兼容性处理: 确保 summary 是 Polars DataFrame 以便使用高性能 sort
-            if isinstance(summary, pd.DataFrame):
-                summary_pl = pl.from_pandas(summary)
-            else:
-                summary_pl = summary
-            
-            # 映射简写指令到真实列名
-            sort_map = {
-                # --- 强度 (Strength) ---
-                "iv": "IV_total", 
-                "ks": "KS_total", 
-                "auc": "AUC_total", 
-                
-                # --- 稳定性 (Stability) ---
-                "psi": "PSI_max",        # 关注最坏漂移情况
-                "drift": "PSI_max",      # psi 的别名
-                
-                # --- 逻辑性 (Logic) ---
-                "rc": "RC_min",          # 关注逻辑反转风险
-                "logic": "RC_min",       # rc 的别名
-                
-                # --- 时效性 (Recency) ---
-                "decay": "IV_change_pct", # 关注特征衰减程度
-                "trend": "IV_change_pct", # decay 的别名
-                
-                # --- 综合决策 ---
-                "rank": "Mars_Decision"   # 按 Keep/Drop/Watch 排序
-            }
-            
-            # get(key, default) -> 允许用户直接传 'IV_recent' 这种原始列名
-            sort_key = sort_map.get(sort_by.lower(), sort_by)
-            
-            # [防御性检查] 再次确认 sort_key 是否真的在 summary 表里
-            if sort_key not in report.summary_table.columns:
-                logger.warning(f"⚠️ Sort column '{sort_key}' not found in summary report. Fallback to 'IV_total'.")
-                sort_key = "IV_total"
-            
-            # 执行排序与截断
-            if sort_key in summary_pl.columns:
-                sorted_feats = (
-                    summary_pl
-                    .sort(sort_key, descending=not ascending)
-                    .get_column("feature")
-                    .to_list()
-                )
-                
-                # [熔断机制] 如果特征数超过 max_plots，仅绘制 Top N
-                if max_plots and max_plots > 0 and len(sorted_feats) > max_plots:
-                    logger.info(f"📉 [Visual Protection] Plotting Top {max_plots} features sorted by '{sort_key}' (out of {len(sorted_feats)}).")
-                    plot_features = sorted_feats[:max_plots]
-                else:
-                    plot_features = sorted_feats
-            else:
-                logger.warning(f"⚠️ Sort key '{sort_key}' not found in summary table. Plotting unsorted features.")
-
-            # ==========================================================================
-            # 3. Visualization: 批量绘图
-            # ==========================================================================
-            self.plot_feature_binning_risk_trends(
-                report=report,
-                features=plot_features, # 传入筛选后的列表
-                group_col=report.group_col,
-                sort_by=sort_by,
-                ascending=ascending,
-                dpi=dpi
-            )
-            
-            return report
-            
-        finally:
-            # ==========================================================================
-            # 4. Teardown: 状态还原
-            # ==========================================================================
-            # 无论执行成功与否，必须还原实例属性，防止本次临时参数污染后续调用
-            self.target_col = original_target
-            self.bining_type = original_bining_type
-            # [核心改进] 还原 kwargs，防止污染
-            self.binner_kwargs = original_binner_kwargs
             
 
 def profile_risk(
-    # --- 数据输入 (Data Input) ---
     df: Union[pl.DataFrame, pd.DataFrame],
     target: Union[str, List[str]], 
     features: Optional[List[str]] = None,
     
-    # --- 评估上下文 (Evaluation Context) ---
     profile_by: Optional[str] = None,
     dt_col: Optional[str] = None,
     benchmark_df: Optional[Union[pl.DataFrame, pd.DataFrame]] = None,
     weights_col: Optional[str] = None,
     
-    # --- 分箱策略参数 (Binning Strategy) ---
     binning_type: Literal["native", "opt"] = "native",
     n_bins: int = 5,
     min_bin_size: float = 0.02,
@@ -1711,7 +1362,6 @@ def profile_risk(
     missing_values: Optional[List[Any]] = None,
     binner_kwargs: Optional[Dict[str, Any]] = None,
     
-    # --- 绘图控制 (Plotting Control) ---
     plot: bool = True,
     plot_target: Union[str, List[str], None] = None,
     max_plots: int = 10,
@@ -1719,7 +1369,6 @@ def profile_risk(
     ascending: bool = False,
     dpi: int = 300,
     
-    # --- 性能参数 (Performance) ---
     n_jobs: int = -1,
     batch_size: int = 500
 ) -> MarsEvaluationReport:
@@ -1803,7 +1452,6 @@ def profile_risk(
         - `trend_tables`: 指标趋势宽表字典 (仅包含主目标数据)。
     """
     
-    # --- 0. 参数标准化与模式识别 (Argument Sanitization) ---
     target_list = [target] if isinstance(target, str) else target
     if not target_list:
         raise ValueError("Target cannot be empty.")
@@ -1811,7 +1459,6 @@ def profile_risk(
     primary_target = target_list[0]
     is_multi_target = len(target_list) > 1
     
-    # 1. 组装分箱参数 (Fit Params Assembly)
     fit_params = {
         "n_bins": n_bins,
         "min_bin_size": min_bin_size,
@@ -1820,14 +1467,12 @@ def profile_risk(
         "missing_values": missing_values,
         "n_jobs": n_jobs
     }
-    # 合并用户传递的额外参数 (如 time_limit, cat_cutoff)
     if binner_kwargs:
         fit_params.update(binner_kwargs)
         
     logger.info(f"🚀 Starting Risk Profiling [Primary Target: {primary_target} | Strategy: {binning_type.upper()}]")
     
-    # --- 2. 核心：拟合主目标分箱器 (Fit Primary Binner) ---
-    # 我们先创建一个针对主 Target 的 Evaluator，让它去 Fit
+    # 拟合 main binner
     primary_evaluator = MarsBinEvaluator(
         target_col=primary_target,
         bining_type=binning_type,
@@ -1845,14 +1490,13 @@ def profile_risk(
         batch_size=batch_size
     )
     
-    # [Fast Path] 如果只有单目标，无需合并，直接准备绘图
+    # 如果只有单目标，无需合并，直接准备绘图
     if not is_multi_target:
         # 统一使用最后的绘图逻辑
         final_report = primary_report
         # 这里的 target_list 就是 [primary_target]
     
     else:
-        # --- 3. 多目标循环评估 (Loop for Secondary Targets) ---
         logger.info(f"🔄 Multi-Target Mode: Extending evaluation to {len(target_list)-1} secondary targets...")
         
         # 获取已经训练好的分箱器 (Trained Binner)
@@ -1897,7 +1541,7 @@ def profile_risk(
             all_details.append(s_detail)
             all_summaries.append(s_summary)
 
-        # --- 4. 结果合并 (Merge Results) ---
+        # 结果合并
         logger.info("∑ Merging multi-target reports...")
         
         # 纵向合并所有 Detail 表 (Detail 表本身已有 'y' 列区分 target，无需额外处理)
@@ -1914,8 +1558,7 @@ def profile_risk(
             detail_table=final_detail,
             group_col=primary_report.group_col
         )
-
-    # --- 5. 智能绘图 (Visualization Dispatch) ---
+        
     if plot:
         # 解析需要绘图的 Target 列表
         targets_to_plot = []
@@ -1938,7 +1581,7 @@ def profile_risk(
             _plot_report_helper(
                 evaluator=primary_evaluator, # 复用这个实例的 plot 方法即可
                 report=final_report,
-                target_list=targets_to_plot, # [关键] 传入要画的列表
+                target_list=targets_to_plot, 
                 sort_by=sort_by,
                 ascending=ascending,
                 max_plots=max_plots,
@@ -1985,11 +1628,10 @@ def _plot_report_helper(
     }
     sort_key = sort_map.get(sort_by.lower(), "IV_total")
 
-    # --- 循环绘制每个 Target ---
     for current_target in target_list:
         logger.info(f"📈 [Plotting Target] {current_target} ...")
         
-        # 1. 筛选当前 Target 的 Summary 数据（用于排序）
+        # 筛选当前 Target 的 Summary 数据（用于排序）
         # 注意：不同 Target 下特征的 IV/AUC 是不一样的，所以 Top 特征可能不同
         # 单目标模式下 summary 可能没有 target_col 列，需要兼容
         if "target_col" in summary_all.columns:
@@ -2007,7 +1649,7 @@ def _plot_report_helper(
             else:
                 plot_features = sorted_feats
         
-        # 2. 筛选当前 Target 的 Detail 数据（用于绘图）
+        # 筛选当前 Target 的 Detail 数据（用于绘图）
         # 利用 Evaluator 的 plot 方法支持传入 df_detail 的特性
         # 这里的 filter("y") 是关键，我们在 Evaluator._format_report 里加了这一列
         curr_detail = detail_all.filter(pl.col("y") == current_target)
@@ -2016,7 +1658,7 @@ def _plot_report_helper(
             logger.warning(f"   ⚠️ No detail data found for target '{current_target}'. Skipping.")
             continue
 
-        # 3. 调用底层绘图
+        # 调用底层绘图
         # 注意：这里我们手动传入 df_detail，从而绕过 report.detail_table (那是全量的)
         evaluator.plot_feature_binning_risk_trends(
             report=None, # 不传 report，使用 df_detail
