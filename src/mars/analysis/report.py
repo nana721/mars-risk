@@ -3,7 +3,7 @@
 import os
 import sys
 from copy import copy
-
+from importlib import resources
 import polars as pl
 import pandas as pd
 import numpy as np
@@ -691,14 +691,23 @@ class MarsEvaluationReport:
     def write_excel(self, path: str = "mars_bin_report.xlsx") -> None:
         """
         [Professional Export] 自动化导出分箱明细表。
-        
-        自动识别环境: Win/Mac 调用 Excel (xlwings), Linux 纯代码解析 (openpyxl)。
-        自动定位模板: 自动寻找代码同级目录下的 .xlsx 模板文件。
         """
-        # --- 0. 自动定位模板路径 ---
-        # 获取当前脚本文件所在的绝对目录
-        base_dir = os.path.dirname(os.path.abspath(__file__))
+        # --- 1. 智能定位模板路径 (兼容 pip 安装模式) ---
+        # 假设模板都在 mars.analysis 包下
+        package_name = "mars.analysis" 
+        template_name_win = "mars_bin_report_win_mac.xlsx"
+        template_name_linux = "mars_bin_report_linux.xlsx"
         
+        # 辅助函数：获取真实文件路径
+        def get_template_path(fname):
+            try:
+                # Python 3.9+ 推荐方式
+                with resources.as_file(resources.files(package_name).joinpath(fname)) as p:
+                    return str(p)
+            except Exception:
+                # 回退方案：本地开发调试用
+                return os.path.join(os.path.dirname(os.path.abspath(__file__)), fname)
+
         # --- 配置内部参数 ---
         START_WRITE_ROW = 4
         STYLE_SOURCE_ROW = 2
@@ -707,130 +716,143 @@ class MarsEvaluationReport:
         SHEET_NAME = "分组明细"
 
         # --- 环境检测 ---
+        # [优化] 增加 Linux 判断，不仅是看 OS，还要看是否有 DISPLAY 变量（可选）
         IS_GUI_ENV = sys.platform.startswith("win") or sys.platform.startswith("darwin")
         USE_XLWINGS = False
         
-        # 定义模板文件名 (尚未拼接路径)
-        template_name_win = "mars_bin_report_win_mac.xlsx"
-        template_name_linux = "mars_bin_report_linux.xlsx"
-        
-        # 最终使用的模板路径变量
-        template_path = ""
-
-        if IS_GUI_ENV:
-            try:
-                import xlwings as xw
-                # 尝试静默启动 Excel 实例
-                app = xw.App(visible=False, add_book=False)
-                app.display_alerts = False
-                app.screen_updating = False
-                USE_XLWINGS = True
-                
-                # [修改] 拼接绝对路径
-                template_path = os.path.join(base_dir, template_name_win)
-                
-            except Exception:
-                USE_XLWINGS = False
-        
-        if not USE_XLWINGS:
-            import openpyxl
-            from openpyxl.styles import Font
-            from openpyxl.utils import get_column_letter
-            
-            # [修改] 拼接绝对路径
-            template_path = os.path.join(base_dir, template_name_linux)
-
-        # [新增] 检查模板是否存在，友好报错
-        if not os.path.exists(template_path):
-            raise FileNotFoundError(f"❌ Template file not found at: {template_path}")
-
         # 准备数据
         df_pd = self._to_pd(self.detail_table)
         total_cols = len(df_pd.columns)
 
-        # ------------------ 路径 A: xlwings (Win/Mac) ------------------
-        if USE_XLWINGS:
+        # 尝试加载 xlwings
+        if IS_GUI_ENV:
             try:
+                import xlwings as xw
+                # 测试 Excel 是否真的安装了
+                xw.App(visible=False, add_book=False).quit()
+                USE_XLWINGS = True
+                template_path = get_template_path(template_name_win)
+            except Exception as e:
+                print(f"⚠️ xlwings 启动失败，降级使用 openpyxl: {e}")
+                USE_XLWINGS = False
+
+        if not USE_XLWINGS:
+            import openpyxl
+            from openpyxl.styles import Font
+            from openpyxl.utils import get_column_letter
+            template_path = get_template_path(template_name_linux)
+
+        if not os.path.exists(template_path):
+            raise FileNotFoundError(f"❌ Template file not found: {template_path}")
+
+        # ================= 路径 A: xlwings (Win/Mac) =================
+        if USE_XLWINGS:
+            app = None
+            try:
+                app = xw.App(visible=False, add_book=False)
+                app.display_alerts = False
+                app.screen_updating = False
+                
+                # 打开模板
                 wb = app.books.open(template_path)
                 ws = wb.sheets[SHEET_NAME]
                 
-                # 修复日期整数问题：强制文本化
+                # [Fix] 防止 Excel 将长数字字符串转为科学计数法
                 if 'mars_group' in df_pd.columns:
+                    # 在前面加单引号强制 Excel 认为是文本
                     df_pd['mars_group'] = "'" + df_pd['mars_group'].astype(str)
                 
-                # 批量写入数据
+                # 写入数据
                 ws.range((START_WRITE_ROW, 1)).value = df_pd.values
                 final_row = START_WRITE_ROW + len(df_pd) - 1
                 
-                # 应用样式 (模拟格式刷)
-                source_range = ws.range((STYLE_SOURCE_ROW, 1), (STYLE_SOURCE_ROW, total_cols))
-                data_range = ws.range((START_WRITE_ROW, 1), (final_row, total_cols))
-                source_range.copy()
-                data_range.api.PasteSpecial(Paste=-4122) # xlPasteFormats
+                # 样式格式刷
+                if final_row >= START_WRITE_ROW:
+                    source_range = ws.range((STYLE_SOURCE_ROW, 1), (STYLE_SOURCE_ROW, total_cols))
+                    # 目标范围：从写入行开始到最后
+                    data_range = ws.range((START_WRITE_ROW, 1), (final_row, total_cols))
+                    source_range.copy()
+                    data_range.api.PasteSpecial(Paste=-4122) # xlPasteFormats
                 
-                # 刷新全表字体
-                all_used = ws.used_range
-                all_used.api.Font.Name = FONT_NAME
-                all_used.api.Font.Size = FONT_SIZE
+                # 统一字体 (防止 PasteSpecial 覆盖字体设置)
+                full_range = ws.range((1, 1), (final_row, total_cols))
+                full_range.api.Font.Name = FONT_NAME
+                full_range.api.Font.Size = FONT_SIZE
                 
-                # 更新超级表 Table 范围
+                # 更新超级表 (ListObject)
                 if ws.api.ListObjects.Count > 0:
                     table = ws.api.ListObjects(1)
                     new_ref = ws.range((1, 1), (final_row, total_cols)).get_address(False, False)
+                    # Resize 需要 Range 对象
                     table.Resize(ws.range(new_ref).api)
                 
-                # 清理多余旧数据
-                last_row = ws.api.UsedRange.Rows.Count
-                if last_row > final_row:
-                    ws.range(f"{final_row + 1}:{last_row}").api.Delete()
-                
+                # 清理旧数据
+                last_used_row = ws.api.UsedRange.Rows.Count
+                if last_used_row > final_row:
+                    ws.range(f"{final_row + 1}:{last_used_row}").api.Delete()
+
                 wb.save(path)
-                print(f"✅ [{sys.platform}] 导出成功 (使用 xlwings)")
+                print(f"✅ [Excel Engine] 导出成功: {path}")
+
+            except Exception as e:
+                raise RuntimeError(f"xlwings 导出出错: {e}")
             finally:
-                wb.close()
-                app.quit()
-        
-        # ------------------ 路径 B: openpyxl (Linux) ------------------
+                if 'wb' in locals() and wb: wb.close()
+                if app: app.quit() # 确保退出进程
+
+        # ================= 路径 B: openpyxl (Linux/Server) =================
         else:
             wb = openpyxl.load_workbook(template_path)
             ws = wb[SHEET_NAME]
-            # 兼容性检查：如果列不存在则跳过日期格式化
+            
             mars_group_idx = -1
             if "mars_group" in df_pd.columns:
                 mars_group_idx = list(df_pd.columns).index("mars_group") + 1
             
-            # 抓取并重构样式
-            template_styles = {}
-            for c_idx in range(1, total_cols + 1):
-                src = ws.cell(row=STYLE_SOURCE_ROW, column=c_idx)
-                template_styles[c_idx] = {
-                    "font": Font(name=FONT_NAME, size=FONT_SIZE, bold=src.font.bold, color=src.font.color),
-                    "border": copy(src.border), "fill": copy(src.fill),
-                    "num_fmt": src.number_format, "align": copy(src.alignment)
+            # 1. 缓存样式模板 (从第2行提取)
+            style_map = {}
+            for c in range(1, total_cols + 1):
+                cell = ws.cell(row=STYLE_SOURCE_ROW, column=c)
+                style_map[c] = {
+                    "font": copy(cell.font),
+                    "border": copy(cell.border),
+                    "fill": copy(cell.fill),
+                    "alignment": copy(cell.alignment),
+                    "number_format": cell.number_format
                 }
-            
-            # 写入数据并同步样式
-            for r_idx, row_vals in enumerate(df_pd.values, 1):
-                curr_row = START_WRITE_ROW + r_idx - 1
-                for c_idx, val in enumerate(row_vals, 1):
-                    cell = ws.cell(row=curr_row, column=c_idx, value=val)
-                    s = template_styles.get(c_idx)
-                    if s:
-                        cell.font, cell.border, cell.fill, cell.alignment = s["font"], s["border"], s["fill"], s["align"]
-                        # 强制修复日期列格式问题
-                        cell.number_format = "yyyy-mm-dd" if c_idx == mars_group_idx else s["num_fmt"]
-            
-            final_row = START_WRITE_ROW + len(df_pd) - 1
-            # 清理旧行 & 更新超级表
-            if ws.max_row > final_row: ws.delete_rows(final_row + 1, ws.max_row - final_row)
+
+            # 2. 写入数据
+            rows = df_pd.values.tolist()
+            for r_offset, row_data in enumerate(rows):
+                current_row = START_WRITE_ROW + r_offset
+                for c_offset, value in enumerate(row_data):
+                    c_idx = c_offset + 1
+                    cell = ws.cell(row=current_row, column=c_idx, value=value)
+                    
+                    # 应用样式
+                    if c_idx in style_map:
+                        s = style_map[c_idx]
+                        cell.font = s["font"]
+                        cell.border = s["border"]
+                        cell.fill = s["fill"]
+                        cell.alignment = s["alignment"]
+                        cell.number_format = s["number_format"]
+                    
+                    # 特殊处理：日期列
+                    if c_idx == mars_group_idx:
+                        cell.number_format = "yyyy-mm-dd" # 强制日期格式
+
+            final_row = START_WRITE_ROW + len(rows) - 1
+
+            # 3. 更新超级表范围
             if ws.tables:
-                table = next(iter(ws.tables.values()))
-                table.ref = f"A1:{get_column_letter(total_cols)}{final_row}"
-            
-            # 补修表头字体
-            for r in range(1, START_WRITE_ROW):
-                for c in range(1, total_cols + 1):
-                    ws.cell(r, c).font = Font(name=FONT_NAME, size=FONT_SIZE, bold=ws.cell(r, c).font.bold)
-            
+                # 获取第一个表
+                tbl_name, tbl = next(iter(ws.tables.items()))
+                tbl.ref = f"A1:{get_column_letter(total_cols)}{final_row}"
+
+            # 4. 删除多余行 (Openpyxl 删除行效率较低，但对于报表来说够用)
+            if ws.max_row > final_row:
+                ws.delete_rows(final_row + 1, ws.max_row - final_row)
+
             wb.save(path)
-            print(f"✅ [Linux/NoExcel] 导出成功 (使用 openpyxl)")
+            print(f"✅ [Polars Engine] 导出成功: {path}")

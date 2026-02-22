@@ -4,10 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mars-risk"      
-version = "0.0.9"       
+version = "0.0.10"       
 description = "High-performance Risk Modeling Toolkit powered by Polars"
 readme = "README.md"
 requires-python = ">=3.10" # 推荐 3.10 或 3.11 以获得最佳性能
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Topic :: Office/Business :: Financial :: Accounting",
+]
 license = {file = "LICENSE"}
 keywords = ["risk", "scorecard", "polars", "credit-scoring", "feature-engineering"]
 authors = [
@@ -54,4 +63,6 @@ dev = [
 # 自动发现包配置
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["mars*"]        # 确保只打包 mars 开头的包
+include = ["mars*"]  
+[tool.setuptools.package-data]
+"*" = ["*.xlsx"]      

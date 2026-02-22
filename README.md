@@ -1,5 +1,7 @@
 # 🚀 MARS: High-Performance Risk Modeling Framework
 
+[![PyPI version](https://img.shields.io/pypi/v/mars-risk?color=blue&style=flat-square)](https://pypi.org/project/mars-risk/) [![Python Versions](https://img.shields.io/pypi/pyversions/mars-risk?style=flat-square)](https://pypi.org/project/mars-risk/) [![License](https://img.shields.io/github/license/leeesq/mars-risk?style=flat-square)](LICENSE) [![Tests](https://github.com/leeesq/mars-risk/actions/workflows/test.yml/badge.svg)](https://github.com/leeesq/mars-risk/actions) [![Downloads Month](https://img.shields.io/pypi/dm/mars-risk?style=flat-square&color=orange&label=downloads/mo)](https://pypi.org/project/mars-risk/) [![Downloads Total](https://static.pepy.tech/badge/mars-risk?style=flat-square)](https://pepy.tech/project/mars-risk)[![Author](https://img.shields.io/badge/Author-Christian-blue.svg)](https://github.com/leeesq)
+
 **MARS** (Modeling Analysis Risk Score) 是一个面向信贷风控建模场景的 Python 工具库。它基于 **Polars** 构建数据处理逻辑，并遵循 **Scikit-learn** 的 API 设计规范，旨在为信贷风控大规模宽表场景下的数据画像、特征工程与模型评估提供更高效的解决方案。 
 
 > **核心目标**：通过 Polars 的向量化执行提升数据处理效率，同时保持与 Scikit-learn 流水线（Pipeline）的兼容性。
