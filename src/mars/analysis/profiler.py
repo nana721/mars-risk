@@ -11,7 +11,6 @@ import pandas as pd
 from mars.core.base import MarsBaseEstimator
 from mars.analysis.report import MarsProfileReport
 from mars.analysis.config import MarsProfileConfig
-from mars.feature.binner import MarsNativeBinner
 from mars.utils.logger import logger
 from mars.utils.decorators import time_it 
 from mars.utils.date import MarsDate
@@ -849,6 +848,7 @@ class MarsDataProfiler(MarsBaseEstimator):
                 numeric_missing = [v for v in self.custom_missing if isinstance(v, (int, float)) and not isinstance(v, bool)]
                 numeric_special = [v for v in self.special_values if isinstance(v, (int, float)) and not isinstance(v, bool)]
                 
+                from mars import MarsNativeBinner
                 binner = MarsNativeBinner(
                     features=num_cols,
                     method=self.psi_bin_method, 

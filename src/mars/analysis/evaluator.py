@@ -1066,7 +1066,15 @@ class MarsBinEvaluator(MarsBaseEstimator):
             .join(baseline_df, on=["feature", "bin_index"], how="left")
             .group_by(["feature", group_col])
             .agg(
-                pl.corr("bad_rate", "base_br", method="pearson").fill_null(0).alias("risk_corr")
+                # 1. 只有当正常箱数 > 1 时，才去计算皮尔逊相关系数
+                # 2. 如果正常箱 <= 1, 直接赋予 1.0 放行
+                # 3. .fill_nan(1.0) 用于兜底多箱但坏率完全一致导致方差为 0 报错的情况
+                pl.when(pl.len() > 1)
+                  .then(pl.corr("bad_rate", "base_br", method="pearson"))
+                  .otherwise(pl.lit(1.0))
+                  .fill_nan(1.0)
+                  .fill_null(1.0)
+                  .alias("risk_corr")
             )
         )
 
@@ -1151,7 +1159,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
             .with_columns(pl.lit("Float64").alias("dtype"))
             .select([
                 "feature", "Mars_Decision", "IV_total", "IV_recent", "IV_change_pct", 
-                "PSI_max", "PSI_alert_cnt", "RC_min", "RC_neg_cnt", "Monotonicity",
+                "PSI_max", "PSI_avg", "PSI_alert_cnt", "RC_min", "RC_neg_cnt", "Monotonicity",
                 "KS_total", "AUC_total", "IV_avg", "AUC_avg"
             ])
         )
@@ -1280,7 +1288,6 @@ class MarsBinEvaluator(MarsBaseEstimator):
             dpi=dpi
         )
             
-
 def profile_risk(
     df: Union[pl.DataFrame, pd.DataFrame],
     *,

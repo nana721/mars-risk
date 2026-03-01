@@ -197,7 +197,11 @@ class MarsBinnerBase(MarsTransformer):
             self._cache_X = None
         if "_cache_y" not in self.__dict__:
             self._cache_y = None
-
+            
+    def clear_cache(self):
+        self._cache_X = None
+        self._cache_y = None
+        gc.collect() # 显式触发回收
 
     def _get_safe_values(self, dtype: pl.DataType, values: List[Any]) -> List[Any]:
         """
@@ -889,11 +893,11 @@ class MarsNativeBinner(MarsBinnerBase):
         self,
         features: Optional[List[str]] = None,
         *,
-        method: Literal["cart", "quantile", "uniform"] = "quantile",
+        method: Literal["cart", "quantile", "uniform"] = "cart",
         n_bins: int = 10,
         special_values: Optional[List[Union[int, float, str]]] = None,
         missing_values: Optional[List[Union[int, float, str]]] = None,
-        min_samples: float = 0.05,
+        min_samples: float = 0.02,
         cart_params: Optional[Dict[str, Any]] = None,
         remove_empty_bins: bool = False,
         n_jobs: int = -1,
@@ -905,7 +909,7 @@ class MarsNativeBinner(MarsBinnerBase):
         ----------
         features: List[str], optional
             指定需要进行分箱的数值特征列名。若为 None, 则自动识别 X 中的所有数值列。
-        method: {'cart', 'quantile', 'uniform'}, default='quantile'
+        method: {'cart', 'quantile', 'uniform'}, default='cart'
             分箱策略: 
             - 'cart': 基于决策树的最优分箱。
             - 'quantile': 等频分箱。
@@ -916,7 +920,7 @@ class MarsNativeBinner(MarsBinnerBase):
             特殊值列表。这些值将被强制独立成箱 (如: -999, -9999)。
         missing_values: List[Union[int, float, str]], optional
             自定义缺失值列表。默认 None, NaN 会自动识别并归为 Missing 箱。
-        min_samples: float, default=0.05
+        min_samples: float, default=0.02
             仅在 method='cart' 时有效。决策树叶子节点的最小样本占比。
         cart_params: Dict, optional
             透传给 sklearn.tree.DecisionTreeClassifier 的额外参数。
