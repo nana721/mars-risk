@@ -18,10 +18,7 @@ from mars.utils.plotter import MarsPlotter
 
 class MarsBinEvaluator(MarsBaseEstimator):
     """
-    [MarsBinEvaluator] 特征效能与稳定性评估引擎.
-
-    该类实现了基于 **Map-Reduce 架构** 的大规模特征评估。
-    它解决了传统 Python 风控库在处理宽表（Wide Table, 5000+ Cols）时的内存溢出和 I/O 瓶颈问题。
+    [Mars 分箱评估]
 
     Attributes
     ----------
@@ -31,20 +28,6 @@ class MarsBinEvaluator(MarsBaseEstimator):
         分箱器实例。如果未提供，evaluate 时会自动拟合。
     binner_kwargs : dict
         传递给自动分箱器的额外参数。
-        
-    核心架构 (Architecture)
-    -----------------------
-    1. **单次扫描 (Single-Pass I/O)**:
-        全流程仅对原始大数据执行一次 `unpivot` 和 `agg` 操作（Map 阶段）。
-        后续所有计算（WOE补全、基准对比、Total聚合）均在聚合后的“中间统计表”上完成（Reduce 阶段）。
-    
-    2. **向量化指标计算 (Vectorized Metrics)**:
-        PSI, IV, KS, AUC, Lift 等指标均通过 Polars 表达式引擎在列式内存中计算，
-        完全避免了 Python 循环，利用 SIMD 指令集加速。
-
-    3. **内存/计算均衡**:
-        利用 `streaming=True` 处理 Map 阶段的重型计算，利用内存计算处理 Reduce 阶段的逻辑，
-        在速度和内存消耗之间取得最佳平衡。
         
     Examples
     --------
@@ -107,18 +90,13 @@ class MarsBinEvaluator(MarsBaseEstimator):
         profile_by: Optional[str] = None,
         dt_col: Optional[str] = None,
         benchmark_df: Union[pl.DataFrame, pd.DataFrame, None] = None,
-        # [新增参数] PSI 计算控制
         psi_include_missing: bool = False,
         psi_include_special: bool = False, 
         weights_col: Optional[str] = None,
         batch_size: int = 500
     ) -> "MarsEvaluationReport":
         """
-        [Core] 执行特征评估的主入口 (Main Evaluation Engine).
-
-        该方法编排了从原始数据到最终风控评估报告的全生命周期管理。它集成了
-        自动分箱 (Auto-Binning)、宽表转长表 (Wide-to-Long Unpivoting)、
-        流式聚合 (Streaming Aggregation) 以及向量化指标计算。
+        [Core] 执行特征评估。
 
         Parameters
         ----------
@@ -134,16 +112,16 @@ class MarsBinEvaluator(MarsBaseEstimator):
         dt_col : Optional[str]
             日期列名 (Date Column)。
             - 用于辅助 `profile_by` 生成时间切片。
-            - **智能默认**: 若提供了 `dt_col` 但未指定 `profile_by`，默认按 **'month'** 聚合。
+            - 默认: 若提供了 `dt_col` 但未指定 `profile_by`，默认按 **'month'** 聚合。
         benchmark_df : Union[pl.DataFrame, pd.DataFrame, None]
             PSI 计算的基准数据集 (Expected Distribution Reference)。
-            - **None (默认)**: 使用 `df` 中时间/分组顺序最早的一组作为基准 (Internal Baseline)。
-            - **DataFrame**: 使用外部传入的数据集（如训练集）作为基准 (External Baseline)。
+            - None (默认): 使用 `df` 中时间/分组顺序最早的一组作为基准 (Internal Baseline)。
+            - DataFrame: 使用外部传入的数据集（如训练集）作为基准 (External Baseline)。
         weights_col : Optional[str]
             样本权重列名。
             若指定，所有的统计指标 (IV, AUC, KS, PSI, Lift) 均基于加权频数计算。
         batch_size : int, default=500
-            **[性能调优]** Map 阶段的特征切片大小。
+            Map 阶段的特征切片大小。
             - 较小的值 (e.g., 100) 降低内存峰值，适合超宽表 (5000+ features)。
             - 较大的值 (e.g., 1000) 提升 I/O 吞吐量，适合内存充足的场景。
 
@@ -154,16 +132,6 @@ class MarsBinEvaluator(MarsBaseEstimator):
             - `summary_table`: 特征维度的审计汇总表 (IV, AUC, PSI_max, Efficiency_Score)。
             - `trend_tables`: 指标维度的趋势宽表字典 (Key: 'auc', 'psi'...)。
             - `detail_table`: 最细粒度的分箱明细表。
-
-        Notes
-        -----
-        **执行流程 (Execution Pipeline):**
-        1. **Context Prep**: 标准化输入格式 (Pandas -> Polars) 并解析分组逻辑。
-        2. **Auto-Fit (Optional)**: 若未预置分箱器，基于当前数据自动训练 `MarsNativeBinner`。
-        3. **Map Phase**: 将宽表切分为多个 Batch，流式执行 `unpivot` + `agg`，生成中间统计表。
-        4. **Reduce Phase**: 在内存中汇总 Total 统计量，并计算 WOE/Expected 分布。
-        5. **Vectorized Calc**: 并行计算所有特征的 PSI, IV, KS, AUC, Lift。
-        6. **Audit**: 执行单调性检查 (Spearman) 与逻辑一致性检查 (RiskCorr)。
         """
         
         # 上下文准备
@@ -336,12 +304,6 @@ class MarsBinEvaluator(MarsBaseEstimator):
         """
         [Map Phase] 全量数据扫描，计算最重要的统计量：样本数和坏样本数。
 
-        采用 "分批-流式-聚合" (Batch-Stream-Agg) 策略：
-        1. 将数千个特征切分为多个批次 (Chunk)。
-        2. 对每个批次构建独立的 Lazy Query Plan。
-        3. 利用 Streaming 引擎执行聚合，并立即释放中间结果。
-        4. 最后纵向合并 (Vertical Concat) 所有批次的统计结果。
-
         Parameters
         ----------
         df_binned : pl.DataFrame
@@ -441,8 +403,6 @@ class MarsBinEvaluator(MarsBaseEstimator):
         当评估器检测到 `binner` 实例中缺失某些特征的 WOE 映射表时（例如：仅做了 transform 但未在
         当前 Label 上 fit，或者直接加载了无 WOE 的分箱规则），该方法利用 **已聚合的统计长表** 反向计算 WOE。
 
-        此操作完全在内存中完成（基于聚合后的由少量行组成的小表），避免了再次扫描原始海量数据的 I/O 开销。
-
         Parameters
         ----------
         group_stats_raw : pl.DataFrame
@@ -467,7 +427,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
         # 过滤出需要计算的特征
         target_stats = group_stats_raw.filter(pl.col("feature").is_in(missing_woe_feats))
         
-        epsilon = 1e-9 # 平滑因子，防止除零或对0取对数
+        epsilon = 1e-6 # 平滑因子，防止除零或对0取对数
 
         # 计算 WOE
         woe_df = (
@@ -589,18 +549,11 @@ class MarsBinEvaluator(MarsBaseEstimator):
         stats_df: pl.DataFrame, 
         expected_dist: pl.DataFrame, 
         group_col: str,
-        # [PSI 控制参数]
         include_missing: bool = True,
         include_special: bool = True
     ) -> pl.DataFrame:
         """
-        [Math Core] 基于聚合结果的向量化指标计算引擎 (Vectorized Metrics Engine).
-
-        该方法是评估器的数学核心。它利用 Polars 的 **窗口函数 (Window Functions)** 和 **列式表达式**，
-        在内存中（无需再次扫描原始数据）并行计算所有特征在所有分组下的核心风控指标。
-
-        相比于传统的 Python `for` 循环计算（复杂度 $O(N \times M)$），该实现利用 SIMD 指令集，
-        将复杂度降低至 $O(N)$（其中 N 为分箱后的总行数），极度高效。
+        [Math Core] 基于聚合结果计算统计指标
 
         Parameters
         ----------
@@ -618,30 +571,6 @@ class MarsBinEvaluator(MarsBaseEstimator):
         -------
         pl.DataFrame
             包含分箱级指标详情的 DataFrame。
-            - **数据粒度**: `[group_col, feature, bin_index]`
-            - **关键列**: `psi_bin`, `iv_bin`, `ks_bin`, `auc_bin` (梯形面积贡献), `lift`。
-            - **副作用**: 返回的数据已严格根据 `woe` 排序，以支持正确的累积分布计算。
-
-        Notes
-        -----
-        **指标计算逻辑 (Metric Formulas):**
-
-        1. **PSI (群体稳定性指标)**:
-           .. math:: PSI = \\sum (Actual\\% - Expected\\%) \\times \\ln(\\frac{Actual\\%}{Expected\\%})
-
-        2. **IV (信息值)**:
-           使用预计算的 WOE 避免重复 Log 计算风险：
-           .. math:: IV = \\sum (Good\\% - Bad\\%) \\times WOE
-
-        3. **KS (柯尔莫哥洛夫-斯米尔诺夫统计量)**:
-           .. math:: KS = \\max | CumBad\\% - CumGood\\% |
-
-        4. **AUC (ROC 曲线下面积)**:
-           使用 **梯形法则 (Trapezoidal Rule)** 进行数值积分，无需展开样本：
-           .. math:: AUC = \\sum \\frac{(CumBad_i + CumBad_{i-1}) \\times (CumGood_i - CumGood_{i-1})}{2}
-
-        5. **Lift (提升度)**:
-           .. math:: Lift = \\frac{\\text{Bin Bad Rate}}{\\text{Total Bad Rate}}
         """
         # 构建 WOE 映射表
         woe_data = [
@@ -663,7 +592,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
             ])
         )
 
-        epsilon = 1e-9
+        epsilon = 1e-6
         
         # 构建 PSI 专用计算域 
         # 定义哪些箱子参与 PSI 计算
@@ -703,13 +632,12 @@ class MarsBinEvaluator(MarsBaseEstimator):
 
         # 指标计算
         base_df = base_df.with_columns([
-            # --- 常规指标 (基于全量) ---
             ((pl.col("count") + epsilon) / (pl.col("total_count") + epsilon)).alias("actual_dist"),
             (pl.col("bad") / (pl.col("total_bad") + epsilon)).alias("bad_dist"),    
             (pl.col("good") / (pl.col("total_good") + epsilon)).alias("good_dist"), 
             (pl.col("bad") / (pl.col("count") + epsilon)).alias("bad_rate"),        
             
-            # --- PSI (基于动态归一化) ---
+            # PSI
             # 计算归一化后的 Actual% (只针对有效箱)
             (pl.col("count") / (pl.col("total_count_psi") + epsilon)).alias("act_prob_clean"),
             # 计算归一化后的 Expected% (只针对有效箱)
@@ -717,22 +645,30 @@ class MarsBinEvaluator(MarsBaseEstimator):
             (pl.col("expected_dist") / (pl.col("total_expected_dist_psi") + epsilon)).alias("exp_prob_clean")
         ])
 
-        # 最终计算 PSI bin contribution
+        # PSI bin contribution
         base_df = base_df.with_columns([
             # 仅在有效箱上计算 PSI，无效箱置为 None
             pl.when(psi_valid_cond)
             .then(
-                (pl.col("act_prob_clean") - pl.col("exp_prob_clean")) * (pl.col("act_prob_clean") / (pl.col("exp_prob_clean") + epsilon)).log()
+                (pl.col("act_prob_clean") - pl.col("exp_prob_clean")) 
+                * 
+                (pl.col("act_prob_clean") / (pl.col("exp_prob_clean") + epsilon)).log()
             )
             .otherwise(None)
             .alias("psi_bin"),
             
             # Lift
-            (pl.col("bad_rate") / ((pl.col("total_bad") + epsilon) / (pl.col("total_count") + epsilon))).alias("lift"),
+            (
+                pl.col("bad_rate") 
+                / 
+                ((pl.col("total_bad") + epsilon) / (pl.col("total_count") + epsilon))
+            ).alias("lift"),
             
             # IV 
             (
-                (pl.col("bad_dist") - pl.col("good_dist")) * ((pl.col("bad_dist") + epsilon) / (pl.col("good_dist") + epsilon)).log()
+                (pl.col("bad_dist") - pl.col("good_dist")) 
+                * 
+                ((pl.col("bad_dist") + epsilon) / (pl.col("good_dist") + epsilon)).log()
             ).cast(pl.Float32).alias("iv_bin")
         ])
 
@@ -752,7 +688,8 @@ class MarsBinEvaluator(MarsBaseEstimator):
             # AUC 梯形法则计算面积
             (
                 (pl.col("cum_good_dist") - pl.col("cum_good_dist").shift(1, fill_value=0).over([group_col, "feature"])) 
-                * (pl.col("cum_bad_dist") + pl.col("cum_bad_dist").shift(1, fill_value=0).over([group_col, "feature"])) 
+                * 
+                (pl.col("cum_bad_dist") + pl.col("cum_bad_dist").shift(1, fill_value=0).over([group_col, "feature"])) 
                 / 2
             ).alias("auc_bin")
         ])
@@ -1262,11 +1199,11 @@ class MarsBinEvaluator(MarsBaseEstimator):
     
     def plot_feature_binning_risk_trends(
         self,
+        *,
         report: Optional["MarsEvaluationReport"] = None,
-        df_detail: Union[pl.DataFrame, pd.DataFrame, None] = None, # Modified: 支持 Pandas 输入
+        df_detail: Union[pl.DataFrame, pd.DataFrame, None] = None, 
         features: Union[str, List[str], None] = None,
         group_col: Optional[str] = None, 
-        # [新增] 支持外部传入 Target 名称，用于多目标绘图时的标题显示
         target_name: Optional[str] = None,
         sort_by: str = "iv",
         ascending: bool = False,
@@ -1346,16 +1283,16 @@ class MarsBinEvaluator(MarsBaseEstimator):
 
 def profile_risk(
     df: Union[pl.DataFrame, pd.DataFrame],
+    *,
     target: Union[str, List[str]], 
     features: Optional[List[str]] = None,
-    
     profile_by: Optional[str] = None,
     dt_col: Optional[str] = None,
     benchmark_df: Optional[Union[pl.DataFrame, pd.DataFrame]] = None,
     weights_col: Optional[str] = None,
     
     binning_type: Literal["native", "opt"] = "native",
-    n_bins: int = 5,
+    n_bins: int = 10,
     min_bin_size: float = 0.02,
     monotonic_trend: str = "auto_asc_desc",
     special_values: Optional[List[Any]] = None,
@@ -1370,7 +1307,7 @@ def profile_risk(
     dpi: int = 300,
     
     n_jobs: int = -1,
-    batch_size: int = 500
+    batch_size: int = 100
 ) -> MarsEvaluationReport:
     """
     [Mars Risk Profiler] 风险特征全景画像扫描。
@@ -1408,7 +1345,7 @@ def profile_risk(
         分箱算法策略。
         - `'native'`: 极速原生分箱 (Quantile/Uniform/CART)。
         - `'opt'`: 最优分箱 (OptBinning)，支持单调性约束。
-    n_bins : int, default 5
+    n_bins : int, default 10
         最大分箱数。
     min_bin_size : float, default 0.02
         最小箱占比约束 (0.0 ~ 0.5)。
@@ -1440,7 +1377,7 @@ def profile_risk(
 
     n_jobs : int, default -1
         并行核心数。
-    batch_size : int, default 500
+    batch_size : int, default 100
         批处理大小。降低此值可减少内存峰值，适合处理超宽表。
 
     Returns
@@ -1502,7 +1439,6 @@ def profile_risk(
         # 获取已经训练好的分箱器 (Trained Binner)
         trained_binner = primary_evaluator.binner
         
-        # 定义辅助转换函数：确保所有 DataFrame 统一为 Polars 格式以便处理
         def to_pl(d: Union[pl.DataFrame, pd.DataFrame]) -> pl.DataFrame:
             return pl.from_pandas(d) if isinstance(d, pd.DataFrame) else d
 
@@ -1517,11 +1453,10 @@ def profile_risk(
         for sec_target in target_list[1:]:
             logger.info(f"👉 Evaluating Secondary Target: {sec_target}")
             
-            # 实例化一个新的 Evaluator，但传入**已训练好的 Binner**
-            # MarsBinEvaluator 会检测到 binner 非空，从而跳过 fit 阶段，直接 transform
+            # 实例化一个新的 Evaluator，但传入**已训练好的 Binner**, 确保分箱规则复用
             sec_evaluator = MarsBinEvaluator(
                 target_col=sec_target,
-                binner=trained_binner # <--- 核心：复用分箱规则
+                binner=trained_binner # 复用分箱规则
             )
             
             sec_report = sec_evaluator.evaluate(
@@ -1600,7 +1535,7 @@ def _plot_report_helper(
     dpi: int
 ) -> None:
     """
-    [Internal Helper] 辅助绘图函数，处理多 Target 循环与 Top-N 筛选逻辑。
+    辅助绘图函数，处理多 Target 循环与 Top-N 筛选逻辑。
     
     参数
     ----

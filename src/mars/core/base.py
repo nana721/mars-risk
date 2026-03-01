@@ -67,7 +67,7 @@ class MarsBaseEstimator(BaseEstimator):
 
     def _determine_output_format(self, input_is_pandas: bool) -> None:
         """
-        [决策逻辑] 根据用户配置(_output_config)和输入类型，决定最终输出格式。
+        根据用户配置(_output_config)和输入类型，决定最终输出格式。
         
         决策优先级: set_output > 输入类型
         """
@@ -83,7 +83,8 @@ class MarsBaseEstimator(BaseEstimator):
         X: pl.DataFrame | pl.LazyFrame | pd.DataFrame
     ) -> Union[pl.DataFrame, pl.LazyFrame]:
         """
-        [类型守卫] 确保输入数据转换为 Polars DataFrame/LazyFrame, 并执行严格校验。
+        确保输入数据转换为 Polars DataFrame/LazyFrame, 并执行严格校验。
+        
         同时根据输入类型设置默认的输出格式。
         """
         # Case 1: 已经是 Polars (Eager or Lazy)
@@ -117,7 +118,7 @@ class MarsBaseEstimator(BaseEstimator):
         y: pl.Series | pd.Series | np.ndarray | list | None, 
         name: str = "target"
     ) -> Optional[pl.Series]:
-        """[类型守卫] 确保标签 y 转换为 Polars Series。"""
+        """确保标签 y 转换为 Polars Series。"""
         if y is None:
             return None
             
@@ -140,7 +141,7 @@ class MarsBaseEstimator(BaseEstimator):
 
     def _validate_conversion(self, df_pd: pd.DataFrame, df_pl: Union[pl.DataFrame, pl.LazyFrame]):
         """
-        [安全检查] 对比 Pandas 和 Polars 的 Schema, 防止数值类型意外崩坏为字符串。
+        对比 Pandas 和 Polars 的 Schema, 防止数值类型意外崩坏为字符串。
         """
         # 预处理：直接获取 Schema (LazyFrame 支持直接读取元数据，无需 collect)
         pl_schema = df_pl.schema
@@ -221,7 +222,7 @@ class MarsBaseEstimator(BaseEstimator):
 
     def _format_output(self, data: Any) -> Any:
         """
-        [输出格式化] 根据 _return_pandas 标志位，决定是否将结果转回 Pandas。
+        根据 _return_pandas 标志位，决定是否将结果转回 Pandas。
 
         支持递归处理字典和列表结构。
 
@@ -247,17 +248,15 @@ class MarsBaseEstimator(BaseEstimator):
         if isinstance(data, list):
             return [self._format_output(v) for v in data]
 
-        # 核心转换逻辑：Polars -> Pandas
+        # Polars -> Pandas
         if isinstance(data, pl.DataFrame):
             return data.to_pandas()
             
         return data
 
-
 class MarsTransformer(MarsBaseEstimator, TransformerMixin, ABC):
     """
-    [转换器基类]
-    集成了自动 Pandas 互操作性。
+    [Mars 转换器基类] 集成了自动 Pandas 互操作性。
     """
 
     def __init__(self):
@@ -332,11 +331,9 @@ class MarsTransformer(MarsBaseEstimator, TransformerMixin, ABC):
         """
         pass
     
-
-
 class MarsBaseSelector(MarsBaseEstimator, ABC):
     """
-    [特征筛选器基类] MarsBaseSelector
+    [Mars 特征筛选器基类] MarsBaseSelector
     
     所有特征筛选组件 (Stats, Linear, Importance) 的父类。
     它封装了特征管理的通用逻辑，并提供了一套标准的“尸检报告”生成机制。

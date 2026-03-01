@@ -76,7 +76,6 @@ import polars as pl
 import numpy as np
 
 from mars.core.base import MarsBaseSelector
-from mars.analysis.profiler import MarsDataProfiler
 from mars.feature.binner import MarsNativeBinner, MarsOptimalBinner
 from mars.analysis.evaluator import MarsBinEvaluator
 from mars.utils.logger import logger
@@ -183,6 +182,7 @@ class MarsStatsSelector(MarsBaseSelector):
         
         # 1. 实例化 Profiler
         # 我们只计算 DQ 指标，关闭 sparkline 和 stat metrics 以获得极致性能
+        from mars.analysis.profiler import MarsDataProfiler
         profiler = MarsDataProfiler(
             df, 
             features=features,

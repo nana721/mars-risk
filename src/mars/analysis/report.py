@@ -768,9 +768,15 @@ class MarsEvaluationReport:
                 
                 # 样式格式刷
                 if final_row >= START_WRITE_ROW:
-                    source_range = ws.range((STYLE_SOURCE_ROW, 1), (STYLE_SOURCE_ROW, total_cols))
-                    # 目标范围：从写入行开始到最后
-                    data_range = ws.range((START_WRITE_ROW, 1), (final_row, total_cols))
+                    # 强制转换为原生 Python int，防止 np.int64 导致 COM 接口崩溃
+                    src_row = int(STYLE_SOURCE_ROW)
+                    start_row = int(START_WRITE_ROW)
+                    end_row = int(final_row)
+                    max_col = int(total_cols)
+
+                    source_range = ws.range((src_row, 1), (src_row, max_col))
+                    data_range = ws.range((start_row, 1), (end_row, max_col))
+                    
                     source_range.copy()
                     data_range.api.PasteSpecial(Paste=-4122) # xlPasteFormats
                 

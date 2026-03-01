@@ -1,28 +1,22 @@
-from typing import List
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-from matplotlib.ticker import FuncFormatter
+from typing import List, Optional, Union
+import base64
+import uuid 
+from io import BytesIO
+from IPython.display import display, HTML
+
 import pandas as pd
 import polars as pl
 import numpy as np
-from typing import Union, Optional
-from IPython.display import display, HTML
-import base64
-from io import BytesIO
-import uuid 
-from mars.utils.logger import logger
 
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.ticker import FuncFormatter
+
+from mars.utils.logger import logger
 
 class MarsPlotter:
     """
-    [可视化组件] MarsPlotter - 专注于风控特征效能与稳定性分析的可视化引擎。
-
-    该类提供了将特征分箱结果（Binning Details）转化为直观图表的能力。
-    核心图表结合了：
-    1. **柱状图 (Bars)**: 展示样本分布（Count Distribution），用于识别数据稀疏性。
-    2. **折线图 (Lines)**: 展示风险趋势（Bad Rate），用于验证特征的逻辑单调性。
-    3. **双轴设计**: 左轴代表分布占比，右轴代表坏率。
-    4. **交互式容器**: 通过 HTML/JS 实现双击缩放，解决宽表展示不全的问题。
+    专注于风控特征效能与稳定性分析的可视化工具。
     """
     
     UNIT_WIDTH = 3  # 单个子图的基准宽度
@@ -31,7 +25,7 @@ class MarsPlotter:
     @staticmethod
     def _show_scrollable(fig: plt.Figure, dpi: int = 150):
         """
-        [辅助函数] 将 Matplotlib 图表包装进可滚动、可点击放大的交互式 HTML 容器。
+        将 Matplotlib 图表包装进可滚动、可点击放大的交互式 HTML 容器。
 
         Parameters
         ----------
@@ -40,20 +34,20 @@ class MarsPlotter:
         dpi : int, default 150
             图像分辨率。
         """
-        # 1. 将图像序列化为 Base64 字符串
+        # 将图像序列化为 Base64 字符串
         buf = BytesIO()
         fig.savefig(buf, format='png', bbox_inches='tight', dpi=dpi) 
         buf.seek(0)
         img_str = base64.b64encode(buf.read()).decode('utf-8')
-        plt.close(fig) # 及时关闭 figure 释放内存
+        plt.close(fig) # 关闭 figure 释放内存
         
-        # 2. 生成唯一 ID 避免 HTML 元素冲突
+        # 生成唯一 ID 避免 HTML 元素冲突
         unique_id = str(uuid.uuid4())
         container_id = f"cont_{unique_id}"
         img_id = f"img_{unique_id}"
         hint_id = f"hint_{unique_id}"
         
-        # 3. 构造 HTML 代码：包含缩放逻辑的 CSS 和 JS
+        # 构造 HTML 代码：包含缩放逻辑的 CSS 和 JS
         html_code = f"""
         <style>
             #{container_id} {{
@@ -120,7 +114,7 @@ class MarsPlotter:
         dpi: Optional[int] = 150
     ):
         """
-        绘制特征分箱风险趋势图 (Feature Binning Risk Trend Plot)。
+        绘制特征分箱风险趋势图。
 
         该图表集成了特征的：
         - 样本分布 (Counts)
@@ -145,7 +139,7 @@ class MarsPlotter:
         if isinstance(df_detail, pl.DataFrame):
             df_detail = df_detail.to_pandas()
             
-        df_feat = df_detail[df_detail["feature"] == feature].copy()
+        df_feat: pd.DataFrame = df_detail[df_detail["feature"] == feature].copy()
         
         if df_feat.empty:
             print(f"❌ Feature '{feature}' not found.")
@@ -155,7 +149,7 @@ class MarsPlotter:
              print(f"❌ Group column '{group_col}' not found.")
              return
 
-        # 1. 提取全局汇总指标 (Total 维度)
+        # 提取全局汇总指标 (Total 维度)
         if "Total" in df_feat[group_col].values:
             df_total = df_feat[df_feat[group_col] == "Total"]
         else:
@@ -167,11 +161,11 @@ class MarsPlotter:
         global_auc = df_total['auc_bin'].sum()
         if global_auc < 0.5: global_auc = 1 - global_auc # 纠正 AUC 方向
         
-        # [逻辑] 计算特征整体趋势 (Trend)：通过分箱序号与坏率的相关系数判断单调性
+        # 计算特征整体趋势 (Trend)：通过分箱序号与坏率的相关系数判断单调性
         df_trend_calc = df_total[df_total['bin_index'] >= 0].sort_values('bin_index')
         trend_str = "n.a."
         
-        # 1. 优先尝试从 DataFrame 列中直接获取
+        # 优先尝试从 DataFrame 列中直接获取
         if "trend" in df_total.columns:
             # 取第一行的值即可，因为同一个特征在 Total 分组下 trend 是一样的
             raw_trend = df_total["trend"].iloc[0]
@@ -179,7 +173,7 @@ class MarsPlotter:
             if pd.notna(raw_trend) and str(raw_trend).lower() != "undefined":
                 trend_str = str(raw_trend)
         
-        # 2. 如果上游没有计算 trend (兼容旧版本)，则回退到现场计算逻辑
+        # 如果上游没有计算 trend，则回退到现场计算逻辑
         if trend_str == "n.a.":
             # [Fallback] 原有的现场计算逻辑 (保留作为兜底)
             df_trend_calc = df_total[df_total['bin_index'] >= 0].sort_values('bin_index')
@@ -208,7 +202,7 @@ class MarsPlotter:
         groups = sorted(groups)
         time_range = f"[{groups[0]} ~ {groups[-1]}]" if groups else ""
         
-        # [逻辑] 提取 RiskCorr (RC) 基准：使用最早的一个分组作为风险排序的标杆
+        # 提取 RiskCorr (RC) 基准：使用最早的一个分组作为风险排序的标杆
         if groups:
             first_group = groups[0]
             base_vec = (
@@ -219,7 +213,7 @@ class MarsPlotter:
         else:
             base_vec = None
 
-        # 2. 画布布局设置
+        # 画布布局设置
         if "Total" in df_feat[group_col].values:
             all_groups = groups + ["Total"]
         else:
@@ -247,15 +241,15 @@ class MarsPlotter:
             left=0.05, right=0.95, top=0.75, bottom=0.15 
         )
         
-        # 3. 绘制顶部全局摘要信息栏
+        # 绘制顶部全局摘要信息栏
         summary_str_1 = f"{feature},  {target_name},  Total: {int(total_count)},  {time_range}"
-        summary_str_2 = f"IV: {global_iv:.3f},  KS: {global_ks*100:.1f},  AUC: {global_auc:.2f},  Missing: {miss_str},  Trend: {trend_str}"
+        summary_str_2 = f"IV: {global_iv:.3f},  KS: {global_ks:.1f},  AUC: {global_auc:.2f},  Missing: {miss_str},  Trend: {trend_str}"
         
         fig.text(0.04, 0.94, summary_str_1 + "\n" + summary_str_2, 
                  fontsize=fs_title+0.85, va='top', ha='left', linespacing=1.6, 
                  bbox=dict(boxstyle="round,pad=0.4", fc="#f0f0f0", ec="#cccccc", alpha=0.8))
 
-        # [优化] 预计算全局最大值：确保所有子图的 Y 轴刻度一致，方便跨期对比
+        # 预计算全局最大值：确保所有子图的 Y 轴刻度一致，方便跨期对比
         global_max_count = 0.0
         global_max_bad = 0.0
         
@@ -267,13 +261,13 @@ class MarsPlotter:
             if len(_counts) > 0: global_max_count = max(global_max_count, _counts.max())
             if len(_bads) > 0: global_max_bad = max(global_max_bad, _bads.max())
         
-        # 4. 循环绘制每个分组的指标面板
+        # 循环绘制每个分组的指标面板
         to_percent = FuncFormatter(lambda y, _: '{:.0%}'.format(y))
 
         for i, group in enumerate(all_groups):
             ax = plt.subplot(gs[i])
             
-            # [核心计算] RiskCorr: 计算当前分组风险排序与首月相关性，评估模型稳定性
+            # RiskCorr: 计算当前分组风险排序与首月相关性，评估模型稳定性
             rc_val = 1.0  
             if base_vec is not None:
                 curr_df_g = df_feat[df_feat[group_col] == group].sort_values("bin_index")
@@ -285,7 +279,6 @@ class MarsPlotter:
             
             for spine in ax.spines.values():
                 spine.set_linewidth(0.2)
-                # spine.set_edgecolor('#CCCCCC')
             
             df_g = df_feat[df_feat[group_col] == group].sort_values("bin_index")
             if df_g.empty: continue
@@ -296,7 +289,7 @@ class MarsPlotter:
             counts = df_g["count"] / df_g["count"].sum() if "count_dist" not in df_g.columns else df_g["count_dist"]
             bads = df_g["bad_rate"]
             
-            # --- A. 柱状图：展示样本分布 (灰色) ---
+            # A. 柱状图：展示样本分布 (灰色) 
             # 仅在第一个子图添加 Label，防止 Legend 混乱
             label_bar = 'Count Dist' if i == 0 else None
             ax.bar(x, counts, color='grey', label=label_bar, alpha=0.4)
@@ -312,7 +305,7 @@ class MarsPlotter:
             ax.set_xticklabels(labels, rotation=90, fontsize=fs_label+1.5)
             ax.tick_params(axis='x', length=0)
             
-            # --- B. 折线图：展示坏率趋势 (红色) ---
+            # B. 折线图：展示坏率趋势 (红色) 
             ax2 = ax.twinx()
             for spine in ax2.spines.values():
                 spine.set_linewidth(0.2)       # 保持与 ax 一致的宽度
@@ -343,7 +336,7 @@ class MarsPlotter:
             else:
                 ax2.set_yticks([]) # 仅保留最右侧坐标轴
             
-            # --- C. 数据标注 (BadRate & Lift) ---
+            # C. 数据标注 (BadRate & Lift) 
             for j, val in enumerate(bads):
                 is_special = indices[j] < 0
                 color_lift_text = COLOR_BLUE if is_special else 'black'
@@ -361,7 +354,8 @@ class MarsPlotter:
                 # 在柱状图内部底部标注样本分布占比
                 ct_val = counts.iloc[j]
                 ax.text(j, max(counts) * 0.05, f"{ct_val:.1%}", color='#333333', ha='center', va='bottom', fontsize=fs_text+0.5)
-            # --- D. 子图顶部指标汇总 ---
+            
+            # D. 子图顶部指标汇总 
             iv_val  = df_g['iv_bin'].sum()
             ks_val  = df_g['ks_bin'].max()
             auc_val = df_g['auc_bin'].sum()
@@ -440,7 +434,7 @@ class MarsPlotter:
         # 重置交互式容器的显示标记
         display(HTML("<script>window.MARS_PLOTTER_HINT_SHOWN = undefined;</script>"))
             
-        # 1. 计算全局排序得分
+        # 计算全局排序得分
         if sort_by and sort_by.lower() in ['iv', 'ks', 'auc']:
             logger.info(f"📊 Calculating {sort_by.upper()} for sorting...")
             feature_stats = []
@@ -468,7 +462,7 @@ class MarsPlotter:
 
         logger.info(f"🚀 Starting batch plot for {len(sorted_features)} features...")
         
-        # 2. 循环生成每个特征的图表
+        # 循环生成每个特征的图表
         for i, feat in enumerate(sorted_features):
             score_info = ""
             if sort_by and 'df_stats' in locals() and not df_stats[df_stats['feature'] == feat].empty:

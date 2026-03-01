@@ -18,23 +18,23 @@ from mars.utils.date import MarsDate
 
 class MarsDataProfiler(MarsBaseEstimator):
     """
-    [MarsDataProfiler] 基于 Polars 的高性能多维数据画像工具。
+    [Mars 高性能数据画像] 
 
     专为大规模风控建模数据集设计。它作为分析流程的入口，封装了从
     数据质量诊断、统计值计算到可视化生成的全链路逻辑。
 
     主要功能
-    -----------------------
-    1. **全量指标概览 (Overview)**:
+    --------
+    1. 全量指标概览 (Overview):
        - 计算 Missing/Zero/Unique/Top1 等基础 DQ 指标。
        - 自动识别并计算数值列的统计分布 (Mean, Std, Quantiles)。
     
-    2. **迷你分布图 (Sparklines)**:
+    2. 迷你分布图 (Sparklines):
        - 在报告中生成 Unicode 字符画 (如  ▂▅▇█)。
        - **可视化逻辑**: 自动采样 (默认20w行) -> 剔除异常值 -> 等宽分箱 -> 字符映射。
        - 支持通过 Config 调整分箱精度和采样率。
 
-    3. **多维趋势分析 (Trend Analysis)**:
+    3. 多维趋势分析 (Trend Analysis):
        - 支持按时间 (Month/Vintage) 或客群 (Segment) 进行分组分析。
        - 自动计算组间稳定性指标 (Variance/CV)。
 
@@ -218,12 +218,8 @@ class MarsDataProfiler(MarsBaseEstimator):
         [Core] 执行数据画像分析管道，生成完整分析报告。
 
         该方法会自动计算两类指标：
-        1. **Overview (全量概览)**: 包含数据分布(Sparkline)、DQ指标、统计指标。不涉及分组。
-        2. **Trends (分组趋势)**: 如果指定了 `profile_by`，会计算各项指标随该维度的变化。
-        
-        **日期聚合功能 (New)**:
-        如果指定了 `dt_col`，`profile_by` 可直接传入 "day", "week", "month"。
-        程序会自动基于 `dt_col` 生成对应的时间粒度列进行分组分析。
+        - Overview：包含数据分布(Sparkline)、DQ指标、统计指标。不涉及分组。
+        - Trends：如果指定了 `profile_by`，会计算各项指标随该维度的变化。
 
         Parameters
         ----------
@@ -312,8 +308,6 @@ class MarsDataProfiler(MarsBaseEstimator):
             # 生成包含临时列的 working_df (Zero-Copy)
             working_df = self.df.with_columns(date_expr.alias(temp_group_col))
             group_col = temp_group_col
-            
-            logger.info(f"📅 Auto-aggregating '{dt_col}' by '{profile_by}' using MarsDate -> '{group_col}'")
 
         elif dt_col is None and profile_by is not None:
             # 常规模式：profile_by 必须是现有列
@@ -425,8 +419,21 @@ class MarsDataProfiler(MarsBaseEstimator):
         该方法通过“分批次向量化 (Batch Vectorization)”策略，平衡了 Polars 的并行计算能力
         与查询优化器 (Query Planner) 的解析开销。
 
+        Parameters
+        ----------
+        cols : List[str]
+            待计算指标的特征名称列表。
+        config : MarsProfileConfig, optional
+            配置对象。控制具体的统计指标计算范围。
+
+        Returns
+        -------
+        pl.DataFrame
+            包含所有特征统计指标的画像宽表。
+            结构: [feature, metric1, metric2, ...]
+            
         Core Logic
-        ---------------------
+        -----------
         1. **分批执行 (Batching)**: 
            针对高维数据（如 5000+ 列），如果一次性生成数万个表达式，Polars 的 Query Planner 
            会因为逻辑图过于复杂而导致解析时间呈指数级上升。通过 `overview_batch_size` 
@@ -443,19 +450,6 @@ class MarsDataProfiler(MarsBaseEstimator):
 
         4. **结果合并**:
            将各批次的计算结果通过 `pl.concat` 进行垂直合并，并统一进行类型转换。
-
-        Parameters
-        ----------
-        cols : List[str]
-            待计算指标的特征名称列表。
-        config : MarsProfileConfig, optional
-            配置对象。控制具体的统计指标计算范围。
-
-        Returns
-        -------
-        pl.DataFrame
-            包含所有特征统计指标的画像宽表。
-            结构: [feature, metric1, metric2, ...]
         """
         if not cols: 
             return pl.DataFrame()
@@ -636,14 +630,6 @@ class MarsDataProfiler(MarsBaseEstimator):
         该方法负责计算单一指标（如 'mean'）在不同时间切片或客群下的变化趋势，
         并将结果整形为 "特征 x 分组" 的矩阵格式。
 
-        Core Logic
-        ---------------------
-        由于 Polars 是列式存储 (Column-oriented)，统计计算通常产出 "1行 x N特征" 的结果。
-        为了生成可读的报告，需要进行 **转置 (Transpose)** 操作：
-        1. **Total 计算**: 对全量数据聚合 -> 转置 -> 得到 [feature, total] 列。
-        2. **Group 计算**: 按 `group_col` 聚合 -> 转置 -> 得到 [feature, group_val_1, group_val_2...] 列。
-        3. **合并**: 将 Total 列与 Group 列通过 feature JOIN，形成最终宽表。
-
         Parameters
         ----------
         metric : str
@@ -664,6 +650,14 @@ class MarsDataProfiler(MarsBaseEstimator):
             透视后的趋势宽表。
             - Index: feature (特征名)
             - Columns: feature, dtype, [group_val_1, ...], total
+            
+        Core Logic
+        ---------------------
+        由于 Polars 是列式存储 (Column-oriented)，统计计算通常产出 "1行 x N特征" 的结果。
+        为了生成可读的报告，需要进行 **转置 (Transpose)** 操作：
+        1. **Total 计算**: 对全量数据聚合 -> 转置 -> 得到 [feature, total] 列。
+        2. **Group 计算**: 按 `group_col` 聚合 -> 转置 -> 得到 [feature, group_val_1, group_val_2...] 列。
+        3. **合并**: 将 Total 列与 Group 列通过 feature JOIN，形成最终宽表。
         """
         # 优先使用传入的上下文 DF，否则回退到 self.df
         target_df = context_df if context_df is not None else self.df
@@ -775,6 +769,22 @@ class MarsDataProfiler(MarsBaseEstimator):
         该方法利用 Polars 的 Streaming 引擎和 Lazy API，高效地计算数值型和类别型特征
         随时间或客群的变化趋势。
 
+        Parameters
+        ----------
+        group_col : str
+            分组列名。通常是时间列 (如 'month') 或 Vintage 列。
+        features : List[str], optional
+            指定需要计算 PSI 的特征子集。如果为 None，则计算 `self.features` 中的所有列。
+        context_df : pl.DataFrame, optional
+            上下文数据集。通常传入包含临时生成的自动聚合时间列的 DataFrame。
+            如果为 None，则使用实例内部的 `self.df`。
+
+        Returns
+        -------
+        pl.DataFrame
+            PSI 趋势宽表 (Pivot Table)。
+            结构: [feature, dtype, group_val_1, group_val_2, ..., total, group_mean, group_var, group_cv]
+            
         Core Logic
         ---------------------
         1. **基准选择 (Baseline)**: 
@@ -792,33 +802,6 @@ class MarsDataProfiler(MarsBaseEstimator):
            - **逻辑**: 如果某特征在**所有分组**下的 PSI 最大值 (`group_max`) 都小于该阈值，
              则认为该特征处于"绝对稳定区/噪声区"，强制将其 `group_cv` 置为 0。
            - 只有当历史数据中至少有一次 PSI 突破阈值时，才计算并展示真实的 CV。
-
-        Parameters
-        ----------
-        group_col : str
-            分组列名。通常是时间列 (如 'month') 或 Vintage 列。
-        features : List[str], optional
-            指定需要计算 PSI 的特征子集。如果为 None，则计算 `self.features` 中的所有列。
-        context_df : pl.DataFrame, optional
-            上下文数据集。通常传入包含临时生成的自动聚合时间列的 DataFrame。
-            如果为 None，则使用实例内部的 `self.df`。
-
-        Returns
-        -------
-        pl.DataFrame
-            PSI 趋势宽表 (Pivot Table)。
-            结构: [feature, dtype, group_val_1, group_val_2, ..., total, group_mean, group_var, group_cv]
-            
-        Notes
-        -----
-        - 架构优化: 采用 "Lazy Batching" 策略。分批将特征推入 Lazy 管道，
-          并在 `_calc_psi_from_stats` 中完成最终合并，减少了频繁 collect 带来的内存碎片。
-          
-        Benchmarks:
-        ---------
-        - 性能: 在 5000 列 x 20 万行规模下 (i7-14700, 64G RAM), 采用全 Lazy 流水线后
-        实现约 20% 的加速 (150s -> 120s)。
-        - 瓶颈: 计算瓶颈已从内存实例化转向纯逻辑运算, 有效利用了多核并行能力。
         """
         target_df: pl.DataFrame = context_df if context_df is not None else self.df
         
@@ -1060,13 +1043,6 @@ class MarsDataProfiler(MarsBaseEstimator):
         此方法不接触原始明细数据，直接在聚合后的统计表上进行向量化运算，
         是 PSI 计算高性能的核心所在。
 
-        Formula
-        --------
-        1. **Expected (E)**: 基准组 (Baseline) 中各箱的占比。
-        2. **Actual (A)**: 当前组 (Group) 中各箱的占比。
-        3. **PSI Contribution**: (A - E) * ln(A / E)
-        4. **Sum**: 对所有箱求和得到最终 PSI。
-
         Parameters
         ----------
         stats_df : pl.LazyFrame
@@ -1089,12 +1065,12 @@ class MarsDataProfiler(MarsBaseEstimator):
         pl.LazyFrame
             计算结果宽表，包含 feature, group_psi, total_psi 等信息。
             
-        Implementation Details
-        ----------------------
-        - 骨架机制: 函数内部通过 cross join 动态生成 [Group x Feature x Bin] 的全量 Lazy 骨架，
-          强制执行零频格填充 (Epsilon filling)，确保在数据漂移极端（某分箱完全消失）时
-          公式仍具备数值稳定性。
-        - 性能: 输入输出均为 pl.LazyFrame，允许 Polars 优化器进行谓词下推和并行加速。
+        Formula
+        --------
+        1. **Expected (E)**: 基准组 (Baseline) 中各箱的占比。
+        2. **Actual (A)**: 当前组 (Group) 中各箱的占比。
+        3. **PSI Contribution**: (A - E) * ln(A / E)
+        4. **Sum**: 对所有箱求和得到最终 PSI。
         """
         feat_col = "feat_idx" if "feat_idx" in stats_df.collect_schema().names() else "feature"
         epsilon = 1e-6

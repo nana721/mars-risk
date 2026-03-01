@@ -18,14 +18,12 @@ classifiers = [
     "Topic :: Office/Business :: Financial :: Accounting",
 ]
 license = {file = "LICENSE"}
-keywords = ["risk", "scorecard", "polars", "credit-scoring", "feature-engineering"]
+keywords = ["risk", "scorecard", "polars", "credit-scoring", "feature-binning", "modeling", "machine-learning"]
 authors = [
   {name = "christian", email = "lee_sq001@163.com"}
 ]
 
-
 dependencies = [
-    
     "polars>=1.0.0",     
     "numpy>=1.24.0",      
     "pandas>=2.0.0",     
@@ -42,7 +40,7 @@ dependencies = [
 # 安装命令: pip install -e ".[dev]"
 [project.optional-dependencies]
 
-# 机器学习模型支持 (仅当用户需要用你的库跑模型时安装)
+# 机器学习模型支持
 ml = [
     "xgboost>=2.0.0",
     "lightgbm>=4.3.0",
