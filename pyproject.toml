@@ -34,7 +34,8 @@ dependencies = [
     "optbinning>=0.19.0",  
     
     "joblib>=1.3.0",       
-    "colorlog>=6.7.0",    
+    "colorlog>=6.7.0",  
+    "ipython"  
 ]
 
 # 安装命令: pip install -e ".[dev]"
