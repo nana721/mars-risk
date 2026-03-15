@@ -296,7 +296,6 @@ class MarsTransformer(MarsBaseEstimator, TransformerMixin, ABC):
         self._is_fitted = True
         return self
 
-    @time_it
     def transform(
         self, 
         X: pl.DataFrame | pl.LazyFrame | pd.DataFrame, 
@@ -349,9 +348,9 @@ class MarsBaseSelector(MarsBaseEstimator, ABC):
         格式: [{'feature': 'age', 'status': 'Dropped', 'stage': 'Quality', 'reason': 'Missing>0.95', 'value': 0.98}, ...]
     """
 
-    def __init__(self, target_col: str):
+    def __init__(self, target: str):
         super().__init__()
-        self.target_col = target_col
+        self.target = target
         
         # 状态属性
         self.selected_features_: List[str] = []
@@ -370,7 +369,7 @@ class MarsBaseSelector(MarsBaseEstimator, ABC):
         """
         [通用方法] 根据筛选结果裁剪特征。
         
-        只保留 selected_features_ 中的列，以及 target_col (如果存在)。
+        只保留 selected_features_ 中的列，以及 target (如果存在)。
         """
         self._check_is_fitted()
         X = self._ensure_polars_dataframe(X)
@@ -380,8 +379,8 @@ class MarsBaseSelector(MarsBaseEstimator, ABC):
         cols_to_keep = [c for c in self.selected_features_ if c in X.columns]
         
         # 如果原始数据里有 Target，也带上（除非它已经在 selected_features_ 里）
-        if self.target_col in X.columns and self.target_col not in cols_to_keep:
-            cols_to_keep.append(self.target_col)
+        if self.target in X.columns and self.target not in cols_to_keep:
+            cols_to_keep.append(self.target)
             
         return X.select(cols_to_keep)
 
@@ -454,7 +453,7 @@ class MarsBaseSelector(MarsBaseEstimator, ABC):
         """
         # 这里可以加入通用的排除逻辑，比如日期列、ID列等
         # 暂时只排除 Target
-        return [c for c in X.columns if c != self.target_col]
+        return [c for c in X.columns if c != self.target]
 
     def _check_is_fitted(self):
         if not self._is_fitted:

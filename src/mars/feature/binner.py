@@ -897,7 +897,7 @@ class MarsNativeBinner(MarsBinnerBase):
         n_bins: int = 10,
         special_values: Optional[List[Union[int, float, str]]] = None,
         missing_values: Optional[List[Union[int, float, str]]] = None,
-        min_samples: float = 0.02,
+        min_bin_size: float = 0.02,
         cart_params: Optional[Dict[str, Any]] = None,
         remove_empty_bins: bool = False,
         n_jobs: int = -1,
@@ -920,7 +920,7 @@ class MarsNativeBinner(MarsBinnerBase):
             特殊值列表。这些值将被强制独立成箱 (如: -999, -9999)。
         missing_values: List[Union[int, float, str]], optional
             自定义缺失值列表。默认 None, NaN 会自动识别并归为 Missing 箱。
-        min_samples: float, default=0.02
+        min_bin_size: float, default=0.02
             仅在 method='cart' 时有效。决策树叶子节点的最小样本占比。
         cart_params: Dict, optional
             透传给 sklearn.tree.DecisionTreeClassifier 的额外参数。
@@ -935,7 +935,7 @@ class MarsNativeBinner(MarsBinnerBase):
             n_jobs=n_jobs
        )
         self.method = method
-        self.min_samples = min_samples
+        self.min_bin_size = min_bin_size
         self.remove_empty_bins = remove_empty_bins
         
         self.cart_params = cart_params if cart_params is not None else {}
@@ -1387,21 +1387,21 @@ class MarsNativeBinner(MarsBinnerBase):
         n_total_samples = X.height
         def worker(col_name: str, x_clean_np: np.ndarray, y_clean_np: np.ndarray) -> Tuple[str, List[float]]:
             try:
-                # 如果 min_samples 是浮点数 (如 0.05), 则基于 总行数(n_total_samples) 计算
+                # 如果 min_bin_size 是浮点数 (如 0.05), 则基于 总行数(n_total_samples) 计算
                 # 而不是基于 过滤后的行数(len(x_clean_np)) 计算
-                if isinstance(self.min_samples, float):
-                    min_samples_abs = int(np.ceil(self.min_samples * n_total_samples))
+                if isinstance(self.min_bin_size, float):
+                    min_bin_size_abs = int(np.ceil(self.min_bin_size * n_total_samples))
                 else:
-                    min_samples_abs = self.min_samples
+                    min_bin_size_abs = self.min_bin_size
 
                 # 安全检查: 如果清洗后的数据量甚至不足以支撑 2 个最小叶子节点
                 # 说明该特征在有效值范围内过于稀疏, 不应强行分箱
-                if len(x_clean_np) < 2 * min_samples_abs:
-                     return col_name, [float('-inf'), float('inf')], "Insufficient clean samples to satisfy global min_samples."
+                if len(x_clean_np) < 2 * min_bin_size_abs:
+                     return col_name, [float('-inf'), float('inf')], "Insufficient clean samples to satisfy global min_bin_size."
                 
                 cart = DecisionTreeClassifier(
                     max_leaf_nodes=self.n_bins,
-                    min_samples_leaf=min_samples_abs,
+                    min_samples_leaf=min_bin_size_abs,
                     **self.cart_params
                )
                 cart.fit(x_clean_np, y_clean_np)
@@ -1718,7 +1718,7 @@ class MarsOptimalBinner(MarsBinnerBase):
             n_bins=self.n_prebins, 
             special_values=self.special_values,
             missing_values=self.missing_values,
-            min_samples=self.min_prebin_size,
+            min_bin_size=self.min_prebin_size,
             cart_params=self.cart_params,
             n_jobs=self.n_jobs,
             remove_empty_bins=False 

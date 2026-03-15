@@ -151,18 +151,24 @@ class MarsProfileReport:
         </div>
         """
 
-    def show_overview(self) -> "pd.io.formats.style.Styler":
+    def show_overview(self, sort_by: Optional[str | List[str]] = None, ascending: bool = False) -> "pd.io.formats.style.Styler":
         """展示全量概览大宽表"""
+
         return self._get_styler(
-            self.overview_table, 
+            self.overview_table,
             title="Dataset Overview", 
             cmap="RdYlGn_r", 
+            sort_by= ["dtype"] + (["missing_rate"] if sort_by is None else ([sort_by] if isinstance(sort_by, str) else sort_by)),
             # 指定哪些列应用“红绿灯”配色 (高值=红)
             subset_cols=["missing_rate", "zeros_rate", "unique_rate", "top1_ratio"],
             fmt_as_pct=False # 概览表混合了多种类型，不强制全转百分比，由内部逻辑细分
         )
 
-    def show_trend(self, metric: str, ascending: bool = True) -> "pd.io.formats.style.Styler":
+    def show_trend(self, 
+                   metric: str, 
+                   ascending: bool = True, 
+                   sort_by: List[str] | str = "total", 
+                   ascending_sort: bool = False) -> "pd.io.formats.style.Styler":
         """
         [统一接口] 展示指定指标的分组趋势。
 
@@ -178,6 +184,10 @@ class MarsProfileReport:
             指标名称 (如 'missing', 'mean', 'psi')。
         ascending : bool, default True
             时间/分组列的排序方式。
+        sort_by : str or List[str], default 'total'
+            趋势表内部排序的依据列，可以是单列名或多列名列表。
+        ascending_sort : bool, default False
+            趋势表内部排序的方式，默认为降序。
         """
         # 路由逻辑：查找指标属于哪个表
         source_type = self._metric_index.get(metric)
@@ -207,7 +217,7 @@ class MarsProfileReport:
             fmt_pct = False   # PSI 是数值不是百分比
             vmin, vmax = 0.0, 0.5 # 锚定阈值
         
-        df = self._to_pd(df_raw)
+        df = self._to_pd(df_raw).sort_values(by=sort_by, ascending=ascending_sort).copy()
         df = self._reorder_trend_cols(df, ascending)
 
         return self._get_styler(
@@ -374,6 +384,8 @@ class MarsProfileReport:
         df_input: Any, 
         title: str, 
         cmap: str, 
+        sort_by: List[str] = None,
+        ascending: bool = False,
         subset_cols: Optional[List[str]] = None, 
         add_bars: bool = False, 
         fmt_as_pct: bool = False,
@@ -386,6 +398,8 @@ class MarsProfileReport:
         if df_input is None:
             return None
         df: pd.DataFrame = self._to_pd(df_input)
+        if sort_by is not None:
+            df = df.sort_values(by=sort_by, ascending=ascending)
         if df.empty:
             return None
 
@@ -566,10 +580,10 @@ class MarsEvaluationReport:
         df_summary_pd = self._to_pd(self.summary_table)
         n_feats = len(df_summary_pd)
         
-        # 简单统计报警数
+        # 简单统计报警数 (修正为新的小写列名 psi_max)
         high_risk_psi = 0
-        if "PSI_max" in df_summary_pd.columns:
-            high_risk_psi = sum(df_summary_pd["PSI_max"] > 0.25)
+        if "psi_max" in df_summary_pd.columns:
+            high_risk_psi = sum(df_summary_pd["psi_max"] > 0.25)
 
         # 样式定义
         pill_style = (
@@ -611,28 +625,40 @@ class MarsEvaluationReport:
         """
         展示特征汇总评分表。
         """
-        # 转换为 Pandas 以利用 Styler
         df = self._to_pd(self.summary_table)
-        styler = df.style.set_caption("<b>Feature Performance Summary</b>").hide(axis="index")
-
-        # 1. PSI: 低好高坏 (RdYlGn_r)
-        if "PSI_max" in df.columns:
-            styler = styler.background_gradient(
-                cmap="RdYlGn_r", subset=["PSI_max", "PSI_avg"], vmin=0, vmax=0.5
-            )
         
-        # 2. AUC/KS: 高好低坏 (RdYlGn)
-        good_metrics = [c for c in ["AUC_avg", "AUC_min", "KS_max"] if c in df.columns]
-        if good_metrics:
-            styler = styler.background_gradient(
-                cmap="RdYlGn", subset=good_metrics, vmin=0.5, vmax=0.8
-            )
+        # [UI 优化] 如果是多目标模式，自动将 target 列提取到最前面
+        for t_col in ["target", "target_col", "y"]:
+            if t_col in df.columns:
+                cols = [t_col] + [c for c in df.columns if c != t_col]
+                df = df[cols]
+                break
 
-        # 3. 稳定性: CV (低好高坏)
-        if "CV_AUC" in df.columns:
-            styler = styler.bar(subset=["CV_AUC"], color='#ff9999', vmin=0, vmax=0.2)
+        styler = df.style.set_caption("<b>Feature Performance Summary</b>").hide(axis="index")
+        
+        # 1. PSI: 越低越好 (RdYlGn_r 倒序色带，红黄绿)
+        if "psi_max" in df.columns:
+            styler = styler.background_gradient(cmap="RdYlGn_r", subset=["psi_max"], vmin=0, vmax=0.25)
+            
+        # 2. 预测力指标 IV / AUC / KS: 越高越好 (RdYlGn 正序色带，绿黄红)
+        if "iv" in df.columns:
+            styler = styler.background_gradient(cmap="RdYlGn", subset=["iv"], vmin=0.02, vmax=0.6)
+        if "auc" in df.columns:
+            styler = styler.background_gradient(cmap="RdYlGn", subset=["auc"], vmin=0.5, vmax=0.8)
+        if "ks" in df.columns:
+            styler = styler.background_gradient(cmap="RdYlGn", subset=["ks"], vmin=10, vmax=50)
 
-        # 4. 格式化
+        # 3. 逻辑稳定性指标 RC_min: 越接近 1 越好
+        if "rc_min" in df.columns:
+            styler = styler.background_gradient(cmap="RdYlGn", subset=["rc_min"], vmin=0.5, vmax=1.0)
+            
+        # 4. 单调性 mono: 放弃容易引发 CSS 撕裂的 .bar()，改用经典冷暖色带
+        if "mono" in df.columns:
+            # coolwarm 色带: -1 为深蓝(单调递减)，0 为灰白(无单调性)，1 为深红(单调递增)
+            # 非常直观且绝对不会破坏表格的 HTML 结构！
+            styler = styler.background_gradient(cmap="coolwarm", subset=["mono"], vmin=-1, vmax=1)
+
+        # 5. 格式化所有数值列保留 4 位小数
         return styler.format("{:.4f}", subset=df.select_dtypes("number").columns)
 
     def show_trend(self, metric: str, ascending: bool = False) -> "pd.io.formats.style.Styler":
@@ -643,8 +669,7 @@ class MarsEvaluationReport:
             raise ValueError(f"Unknown metric: {metric}. Options: {list(self.trend_tables.keys())}")
         
         # 转换为 Pandas 副本进行样式处理
-        df = self._to_pd(self.trend_tables[metric]).copy()
-        
+        df = self._to_pd(self.trend_tables[metric]).copy().sort_values(by="Total", ascending=ascending)
         # 1. 识别列类型并排序
         meta_cols = ["feature", "dtype"]
         special_cols = ["Total"]

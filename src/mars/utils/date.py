@@ -107,7 +107,9 @@ class MarsDate:
     @staticmethod
     def dt2week(dt: Union[str, pl.Expr]) -> pl.Expr:
         """
-        将日期转换为 'Week' 粒度 (向下取整到周一)。
+        将日期转换为 'Week' 粒度的字符串区间 (如 '20260126-0201').
+
+        逻辑：向下取整到周一作为起点，加上 6 天作为周末终点，最后拼接字符串。
 
         Parameters
         ----------
@@ -117,18 +119,24 @@ class MarsDate:
         Returns
         -------
         pl.Expr
-            类型为 ``pl.Date`` 的表达式，值为该日期所在周的周一。
+            类型为 ``pl.Utf8`` (String) 的表达式。
         """
-        return (
-            MarsDate.smart_parse_expr(dt)
-            .dt.truncate("1w")
-            .cast(pl.Date) 
-        )
+        # 解析并截断到周一 (起点)
+        start_of_week = MarsDate.smart_parse_expr(dt).dt.truncate("1w")
+        # 加上 6 天得到周日 (终点)
+        end_of_week = start_of_week + pl.duration(days=6)
+        
+        # 拼接为 "YYYYMMDD-MMDD" 格式
+        return pl.concat_str([
+            start_of_week.dt.strftime("%Y%m%d"),
+            pl.lit("-"),
+            end_of_week.dt.strftime("%m%d")
+        ])
 
     @staticmethod
     def dt2month(dt: Union[str, pl.Expr]) -> pl.Expr:
         """
-        将日期转换为 'Month' 粒度 (向下取整到当月1号)。
+        将日期转换为 'Month' 粒度的字符串 (如 '202601').
 
         Parameters
         ----------
@@ -138,13 +146,10 @@ class MarsDate:
         Returns
         -------
         pl.Expr
-            类型为 ``pl.Date`` 的表达式，值为该日期所在月的1号。
+            类型为 ``pl.Utf8`` (String) 的表达式。
         """
-        return (
-            MarsDate.smart_parse_expr(dt)
-            .dt.truncate("1mo")
-            .cast(pl.Date)
-        )
+        # 直接使用 strftime 提取年月即可，无需 truncate
+        return MarsDate.smart_parse_expr(dt).dt.strftime("%Y%m")
     
     @staticmethod
     def format_dt(dt: Union[str, pl.Expr], fmt: str = "%Y-%m-%d") -> pl.Expr:
