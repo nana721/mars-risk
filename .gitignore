@@ -1,24 +1,25 @@
-# --- Python 垃圾文件 ---
+#  Python 垃圾文件
 __pycache__/
+.VSCodeCounter/
 *.py[cod]
 *$py.class
 
-# --- 虚拟环境 ---
+# 虚拟环境
 venv/
 .venv/
 mars_env/
 
-# --- IDE 配置 ---
+# IDE 配置
 .idea/
 .vscode/
 .DS_Store
 
-# --- 构建打包文件 ---
+# 构建打包文件
 dist/
 build/
 *.egg-info/
 
-# --- 数据与隐私 ---
+# 数据与隐私 
 *.csv
 *.parquet
 *.pkl
@@ -26,4 +27,7 @@ data/
 output/
 secret_config.py
 .env
-.ipynb
+
+# Jupyter Notebooks
+*.ipynb
+.ipynb_checkpoints/
