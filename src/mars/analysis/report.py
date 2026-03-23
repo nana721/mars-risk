@@ -642,11 +642,11 @@ class MarsEvaluationReport:
             
         # 2. 预测力指标 IV / AUC / KS: 越高越好 (RdYlGn 正序色带，绿黄红)
         if "iv" in df.columns:
-            styler = styler.background_gradient(cmap="RdYlGn", subset=["iv"], vmin=0.02, vmax=0.6)
+            styler = styler.background_gradient(cmap="RdYlGn", subset=["iv"], vmin=0.02, vmax=0.2)
         if "auc" in df.columns:
-            styler = styler.background_gradient(cmap="RdYlGn", subset=["auc"], vmin=0.5, vmax=0.8)
+            styler = styler.background_gradient(cmap="RdYlGn", subset=["auc"], vmin=0.5, vmax=0.65)
         if "ks" in df.columns:
-            styler = styler.background_gradient(cmap="RdYlGn", subset=["ks"], vmin=10, vmax=50)
+            styler = styler.background_gradient(cmap="RdYlGn", subset=["ks"], vmin=5, vmax=20)
 
         # 3. 逻辑稳定性指标 RC_min: 越接近 1 越好
         if "rc_min" in df.columns:
@@ -713,24 +713,36 @@ class MarsEvaluationReport:
         format_cols = [c for c in df.select_dtypes(include=[np.number]).columns]
         return styler.format("{:.4f}", subset=format_cols)
 
-    def write_excel(self, path: str = "mars_bin_report.xlsx") -> None:
+
+    def write_excel(self, path: str = "mars_bin_report.xlsx", engine: str = "openpyxl") -> None:
         """
         [Professional Export] 自动化导出分箱明细表。
-        """
-        # --- 1. 智能定位模板路径 (兼容 pip 安装模式) ---
-        # 假设模板都在 mars.analysis 包下
-        package_name = "mars.analysis" 
-        template_name_win = "mars_bin_report_win_mac.xlsx"
-        template_name_linux = "mars_bin_report_linux.xlsx"
         
-        # 辅助函数：获取真实文件路径
+        Parameters
+        ----------
+        path : str
+            导出的 Excel 文件路径。
+        engine : str, default="openpyxl"
+            写入 Excel 的底层引擎。
+            - "auto": 自动检测，Win/Mac 下优先尝试 xlwings，若失败或在 Linux 下则回退至 openpyxl。
+            - "xlwings": 强制使用 xlwings 引擎 (依赖本地安装的 Excel 应用程序，格式保留最完美)。
+            - "openpyxl": 强制使用 openpyxl 引擎 (无需安装 Excel，跨平台兼容性好)。
+        """
+        valid_engines = ["auto", "xlwings", "openpyxl"]
+        if engine not in valid_engines:
+            raise ValueError(f"❌ 不支持的 engine: '{engine}'，请从 {valid_engines} 中选择。")
+
+        # --- 1. 智能定位模板路径 ---
+        package_name = "mars.analysis" 
+        template_name_xlwings = "mars_bin_report_win_mac.xlsx"
+        template_name_openpyxl = "mars_bin_report_linux.xlsx"
+        
         def get_template_path(fname):
             try:
-                # Python 3.9+ 推荐方式
+                import importlib.resources as resources
                 with resources.as_file(resources.files(package_name).joinpath(fname)) as p:
                     return str(p)
             except Exception:
-                # 回退方案：本地开发调试用
                 return os.path.join(os.path.dirname(os.path.abspath(__file__)), fname)
 
         # --- 配置内部参数 ---
@@ -740,51 +752,61 @@ class MarsEvaluationReport:
         FONT_SIZE = 8
         SHEET_NAME = "分组明细"
 
-        # --- 环境检测 ---
-        # [优化] 增加 Linux 判断，不仅是看 OS，还要看是否有 DISPLAY 变量（可选）
-        IS_GUI_ENV = sys.platform.startswith("win") or sys.platform.startswith("darwin")
-        USE_XLWINGS = False
-        
-        # 准备数据
+        # --- 2. 引擎解析与初始化 ---
+        use_xlwings = False
+
+        if engine == "xlwings":
+            use_xlwings = True
+        elif engine == "openpyxl":
+            use_xlwings = False
+        else:  # "auto"
+            # 自动探测环境
+            is_gui_env = sys.platform.startswith("win") or sys.platform.startswith("darwin")
+            use_xlwings = is_gui_env
+
+        # 验证 xlwings 可用性
+        if use_xlwings:
+            try:
+                import xlwings as xw
+                # 测试 Excel 应用程序是否真正可用
+                xw.App(visible=False, add_book=False).quit()
+                template_path = get_template_path(template_name_xlwings)
+            except Exception as e:
+                if engine == "xlwings":
+                    # 用户强制要求但失败，直接抛错
+                    raise RuntimeError(f"❌ 强制使用 xlwings 引擎失败，请确认系统已正确安装 Excel 及 xlwings 库。\n报错详情: {e}")
+                else:
+                    # auto 模式下失败，降级处理
+                    print(f"⚠️ xlwings 启动失败，将降级使用 openpyxl 引擎: {e}")
+                    use_xlwings = False
+
+        # 若未使用 xlwings，则准备 openpyxl 依赖
+        if not use_xlwings:
+            import openpyxl
+            from openpyxl.utils import get_column_letter
+            from openpyxl.worksheet.table import Table, TableStyleInfo
+            template_path = get_template_path(template_name_openpyxl)
+
+        if not os.path.exists(template_path):
+            raise FileNotFoundError(f"❌ 找不到模板文件: {template_path}")
+
+        # --- 3. 准备数据 ---
         df_pd = self._to_pd(self.detail_table)
         total_cols = len(df_pd.columns)
 
-        # 尝试加载 xlwings
-        if IS_GUI_ENV:
-            try:
-                import xlwings as xw
-                # 测试 Excel 是否真的安装了
-                xw.App(visible=False, add_book=False).quit()
-                USE_XLWINGS = True
-                template_path = get_template_path(template_name_win)
-            except Exception as e:
-                print(f"⚠️ xlwings 启动失败，降级使用 openpyxl: {e}")
-                USE_XLWINGS = False
-
-        if not USE_XLWINGS:
-            import openpyxl
-            from openpyxl.styles import Font
-            from openpyxl.utils import get_column_letter
-            template_path = get_template_path(template_name_linux)
-
-        if not os.path.exists(template_path):
-            raise FileNotFoundError(f"❌ Template file not found: {template_path}")
-
-        # ================= 路径 A: xlwings (Win/Mac) =================
-        if USE_XLWINGS:
+        # ================= 路径 A: xlwings 写入 =================
+        if use_xlwings:
             app = None
             try:
                 app = xw.App(visible=False, add_book=False)
                 app.display_alerts = False
                 app.screen_updating = False
                 
-                # 打开模板
                 wb = app.books.open(template_path)
                 ws = wb.sheets[SHEET_NAME]
                 
-                # [Fix] 防止 Excel 将长数字字符串转为科学计数法
+                # 防止 Excel 将长数字字符串转为科学计数法
                 if 'mars_group' in df_pd.columns:
-                    # 在前面加单引号强制 Excel 认为是文本
                     df_pd['mars_group'] = "'" + df_pd['mars_group'].astype(str)
                 
                 # 写入数据
@@ -793,7 +815,6 @@ class MarsEvaluationReport:
                 
                 # 样式格式刷
                 if final_row >= START_WRITE_ROW:
-                    # 强制转换为原生 Python int，防止 np.int64 导致 COM 接口崩溃
                     src_row = int(STYLE_SOURCE_ROW)
                     start_row = int(START_WRITE_ROW)
                     end_row = int(final_row)
@@ -805,7 +826,7 @@ class MarsEvaluationReport:
                     source_range.copy()
                     data_range.api.PasteSpecial(Paste=-4122) # xlPasteFormats
                 
-                # 统一字体 (防止 PasteSpecial 覆盖字体设置)
+                # 统一字体
                 full_range = ws.range((1, 1), (final_row, total_cols))
                 full_range.api.Font.Name = FONT_NAME
                 full_range.api.Font.Size = FONT_SIZE
@@ -814,7 +835,6 @@ class MarsEvaluationReport:
                 if ws.api.ListObjects.Count > 0:
                     table = ws.api.ListObjects(1)
                     new_ref = ws.range((1, 1), (final_row, total_cols)).get_address(False, False)
-                    # Resize 需要 Range 对象
                     table.Resize(ws.range(new_ref).api)
                 
                 # 清理旧数据
@@ -823,15 +843,15 @@ class MarsEvaluationReport:
                     ws.range(f"{final_row + 1}:{last_used_row}").api.Delete()
 
                 wb.save(path)
-                print(f"✅ [Excel Engine] 导出成功: {path}")
+                print(f"✅ [xlwings Engine] 导出成功: {path}")
 
             except Exception as e:
-                raise RuntimeError(f"xlwings 导出出错: {e}")
+                raise RuntimeError(f"xlwings 导出过程出错: {e}")
             finally:
                 if 'wb' in locals() and wb: wb.close()
-                if app: app.quit() # 确保退出进程
+                if app: app.quit() 
 
-        # ================= 路径 B: openpyxl (Linux/Server) =================
+        # ================= 路径 B: openpyxl 写入 =================
         else:
             wb = openpyxl.load_workbook(template_path)
             ws = wb[SHEET_NAME]
@@ -840,7 +860,7 @@ class MarsEvaluationReport:
             if "mars_group" in df_pd.columns:
                 mars_group_idx = list(df_pd.columns).index("mars_group") + 1
             
-            # 1. 缓存样式模板 (从第2行提取)
+            # 提取并缓存样式模板
             style_map = {}
             for c in range(1, total_cols + 1):
                 cell = ws.cell(row=STYLE_SOURCE_ROW, column=c)
@@ -852,7 +872,7 @@ class MarsEvaluationReport:
                     "number_format": cell.number_format
                 }
 
-            # 2. 写入数据
+            # 写入数据
             rows = df_pd.values.tolist()
             for r_offset, row_data in enumerate(rows):
                 current_row = START_WRITE_ROW + r_offset
@@ -869,21 +889,31 @@ class MarsEvaluationReport:
                         cell.alignment = s["alignment"]
                         cell.number_format = s["number_format"]
                     
-                    # 特殊处理：日期列
+                    # 日期列单独处理
                     if c_idx == mars_group_idx:
-                        cell.number_format = "yyyy-mm-dd" # 强制日期格式
+                        cell.number_format = "yyyy-mm-dd"
 
             final_row = START_WRITE_ROW + len(rows) - 1
 
-            # 3. 更新超级表范围
-            if ws.tables:
-                # 获取第一个表
-                tbl_name, tbl = next(iter(ws.tables.items()))
-                tbl.ref = f"A1:{get_column_letter(total_cols)}{final_row}"
+            # 更新超级表范围并容错
+            if hasattr(ws, 'tables') and ws.tables:
+                new_ref = f"A1:{get_column_letter(total_cols)}{final_row}"
+                for tbl_name in list(ws.tables.keys()):
+                    tbl_obj = ws.tables[tbl_name]
+                    
+                    if hasattr(tbl_obj, 'ref'):
+                        tbl_obj.ref = new_ref
+                    else:
+                        # 容错：处理 openpyxl 偶尔将 Table 解析为纯字符串的问题
+                        del ws.tables[tbl_name]
+                        new_tbl = Table(displayName=tbl_name, ref=new_ref)
+                        style = TableStyleInfo(name="TableStyleMedium9", showRowStripes=True)
+                        new_tbl.tableStyleInfo = style
+                        ws.add_table(new_tbl)
 
-            # 4. 删除多余行 (Openpyxl 删除行效率较低，但对于报表来说够用)
+            # 删除多余行
             if ws.max_row > final_row:
                 ws.delete_rows(final_row + 1, ws.max_row - final_row)
 
             wb.save(path)
-            print(f"✅ [Polars Engine] 导出成功: {path}")
+            print(f"✅ [openpyxl Engine] 导出成功: {path}")

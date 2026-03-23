@@ -31,3 +31,6 @@ secret_config.py
 # Jupyter Notebooks
 *.ipynb
 .ipynb_checkpoints/
+
+# 示例文件
+examples/

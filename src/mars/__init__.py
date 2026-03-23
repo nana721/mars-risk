@@ -3,7 +3,7 @@ from .analysis import MarsDataProfiler, MarsProfileConfig, MarsBinEvaluator, pro
 from .feature import MarsNativeBinner, MarsOptimalBinner, MarsStatsSelector
 from .utils import logger, set_log_level
 
-__version__ = "0.0.11" 
+__version__ = "0.0.12" 
 
 _BANNER = r"""
     __________________________________________________________________________

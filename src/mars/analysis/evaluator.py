@@ -92,7 +92,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
         psi_include_special: bool = False, 
         benchmark_df: Union[pl.DataFrame, pd.DataFrame, None] = None,
         weights_col: Optional[str] = None,
-        batch_size: int = 500
+        batch_size: int = 100
     ) -> "MarsEvaluationReport":
         """
         [Core] 执行特征评估。

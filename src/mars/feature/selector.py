@@ -1,7 +1,7 @@
 # masr/feature/selector.py
 import os
 import json
-from typing import List, Optional, Union, Any, Literal, Dict
+from typing import List, Optional, Union, Any, Literal, Dict, Tuple
 import polars as pl
 import pandas as pd
 import numpy as np
@@ -74,7 +74,8 @@ class MarsStatsSelector(MarsBaseSelector):
         binning_params: Optional[Dict[str, Any]] = None,    
         rough_binning_params: Optional[Dict[str, Any]] = None,  
 
-        max_samples: Optional[int] = None,    
+        max_samples: Optional[int] = None,
+        batch_size: Optional[int] = 100,    
         n_jobs: int = -1
     ):
         """
@@ -139,7 +140,7 @@ class MarsStatsSelector(MarsBaseSelector):
         n_jobs : int, default -1
             并行计算使用的核心数。
         """
-        super().__init__(target)
+        super().__init__(target=target)
         
         # 基础与名单
         self.features = features
@@ -159,7 +160,7 @@ class MarsStatsSelector(MarsBaseSelector):
         
         # Stage 2
         self.skip_rough_scan = skip_rough_scan
-        self.rough_binning_params = rough_binning_params or {"method": "cart", "n_bins": 20, "min_samples": 0.02}
+        self.rough_binning_params = rough_binning_params or {"method": "cart", "n_bins": 20, "min_bin_size": 0.02}
         self.rough_iv_thr = rough_iv_thr
         self.rough_lift_thr = rough_lift_thr
         self.rough_min_sample_rate = rough_min_sample_rate
@@ -177,6 +178,7 @@ class MarsStatsSelector(MarsBaseSelector):
         
         # 性能与执行
         self.max_samples = max_samples
+        self.batch_size = batch_size
         self.n_jobs = n_jobs
 
         # 内部状态存储
@@ -400,7 +402,8 @@ class MarsStatsSelector(MarsBaseSelector):
             df, 
             features=features, 
             dt_col=self.time_col, 
-            profile_by=self.profile_by
+            profile_by=self.profile_by,
+            batch_size=self.batch_size,
         )
         
         # 缓存 Binner 给后续阶段使用
@@ -563,7 +566,7 @@ class MarsStatsSelector(MarsBaseSelector):
 
         return [f for f in features if f in kept_features_set]
 
-    def get_eval_report(self, X: Union[pl.DataFrame, pd.DataFrame]) -> "MarsEvaluationReport":
+    def get_eval_report(self, X: Union[pl.DataFrame, pd.DataFrame]) -> Tuple["MarsEvaluationReport", any]:
         """
         获取最终入选特征的详细评估报告。
         
@@ -576,8 +579,9 @@ class MarsStatsSelector(MarsBaseSelector):
             
         Returns
         -------
-        MarsEvaluationReport
-            包含汇总表、趋势表和分箱明细表的报告对象。可以调用其 .show_summary() 或 .write_excel()。
+        MarsEvaluationReport, MarsBinEvaluator
+            - MarsEvaluationReport 包含汇总表、趋势表和分箱明细表的报告对象。可以调用其 .show_summary() 或 .write_excel();
+            - MarsBinEvaluator 是评估实例，包含了分箱器和评估方法，可以用于后续的 transform 或者其他定制化评估分析。
         """
         self._check_is_fitted()
         
@@ -618,9 +622,9 @@ class MarsStatsSelector(MarsBaseSelector):
             profile_by=self.profile_by
         )
         
-        return report
+        return report, evaluator
 
-    def export_report(self, path: str = "mars_selector_report.xlsx") -> None:
+    def export_selector_report(self, path: str = "mars_selector_report.xlsx") -> None:
         """
         输出尸检详细报告。支持 .xlsx 或 .csv 后缀
         """
