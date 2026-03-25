@@ -1189,8 +1189,14 @@ class MarsBinEvaluator(MarsBaseEstimator):
         
         # 尝试从 Report 提取绘图所需数据
         if report is not None:
-            target_df = report.detail_table.filter(pl.col("bin_index") != 9999) 
+            dt_table = report.detail_table
+            # 兼容 Pandas DataFrame
+            if isinstance(dt_table, pd.DataFrame):
+                target_df = pl.from_pandas(dt_table).filter(pl.col("bin_index") != 9999)
+            else:
+                target_df = dt_table.filter(pl.col("bin_index") != 9999)
             target_group_col = report.group_col
+            
         # 尝试从 df_detail 提取数据
         elif df_detail is not None:
             if isinstance(df_detail, pd.DataFrame):
@@ -1422,18 +1428,20 @@ def profile_risk(
             all_details.append(s_detail)
             all_summaries.append(s_summary)
 
-        # 结果合并
-        # 纵向合并所有 Detail 表 (Detail 表本身已有 'y' 列区分 target，无需额外处理)
+        # 纵向合并所有 Detail 和 Summary 表
         final_detail = pl.concat(all_details)
-        
-        # 纵向合并 Summary 表
         final_summary = pl.concat(all_summaries)
+        
+        # 【修复】如果主目标的表是 Pandas (说明用户传入的是 Pandas)，需要转换回去
+        if isinstance(primary_report.summary_table, pd.DataFrame):
+            final_detail = final_detail.to_pandas()
+            final_summary = final_summary.to_pandas()
         
         logger.info("ℹ️ Note: 'trend_tables' in the report contains data for Primary Target only.")
         
         final_report = MarsEvaluationReport(
             summary_table=final_summary,
-            trend_tables=primary_report.trend_tables, # 仅保留主目标趋势
+            trend_tables=primary_report.trend_tables,
             detail_table=final_detail,
             group_col=primary_report.group_col
         )

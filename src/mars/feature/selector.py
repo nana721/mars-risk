@@ -648,8 +648,6 @@ class MarsStatsSelector(MarsBaseSelector):
             pd_df = report_df.to_pandas()
             
         logger.info(f"💾 Exporting Selection Report to {path}...")
-            
-        logger.info(f"💾 Exporting Selection Report to {path}...")
         
         pd_df = report_df.to_pandas()
         

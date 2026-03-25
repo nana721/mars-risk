@@ -468,7 +468,11 @@ class MarsBinnerBase(MarsTransformer):
                 else:
                     for i in range(len(cuts) - 1):
                         low, high = cuts[i], cuts[i+1]
-                        col_mapping[i] = f"{i:02d}_[{low:.3g}, {high:.3g})"
+                        # ✅ 调用智能格式化函数
+                        low_str = self._format_cut_point(low)
+                        high_str = self._format_cut_point(high)
+                        col_mapping[i] = f"{i:02d}_[{low_str}, {high_str})"
+                        
                     # [优化] 显式生成 labels 确保 cast(Int16) 成功, 修复 PSI=0 Bug
                     bin_labels: List[str] = [str(i) for i in range(len(breaks) + 1)]
                     # ⭐ 构建正常分箱表达式
@@ -663,7 +667,7 @@ class MarsBinnerBase(MarsTransformer):
         y: pl.Series | pd.Series, 
         update_woe: bool = True, 
         batch_size: int = 100
-    ) -> pl.DataFrame:
+    ) -> pl.DataFrame | pd.DataFrame:
         """
         [分箱指标画像] 产出全量分箱深度分析报告 (IV/KS/AUC/Lift)。
 
@@ -680,7 +684,7 @@ class MarsBinnerBase(MarsTransformer):
             
         Returns
         -------
-        polars.DataFrame
+        polars.DataFrame or pandas.DataFrame
             包含每个分箱的统计指标的 DataFrame
         """
         X = self._ensure_polars_dataframe(X)
@@ -736,7 +740,7 @@ class MarsBinnerBase(MarsTransformer):
             agg_results.append(batch_stats)
 
         if not agg_results:
-            return pl.DataFrame()
+            return self._format_output(pl.DataFrame())
 
         stats_df = pl.concat(agg_results)
         del agg_results
@@ -861,7 +865,260 @@ class MarsBinnerBase(MarsTransformer):
         
         base_cols = ["feature", "bin_label", "trend_shape"]
         other_cols = [c for c in final_df.columns if c not in base_cols]
-        return final_df.select(base_cols + other_cols)
+        
+        out_df = final_df.select(base_cols + other_cols)
+        return self._format_output(out_df)
+    
+    def update_bins(
+        self, 
+        bin_rules: Dict[str, Union[List[Union[int, float]], List[List[Any]]]], 
+        X: Optional[Union[pl.DataFrame, pd.DataFrame]] = None,
+        y: Optional[Any] = None,
+    ) -> Optional[pl.DataFrame]:
+        """
+        [Interactive] 批量交互式手动调箱。
+        
+        允许用户批量传入需要强行修改切点的特征字典，系统将自动更新内部规则，
+        并在单次扫描中重新计算所有被修改特征的 WOE 和分箱统计量。
+
+        Parameters
+        ----------
+        bin_rules : Dict[str, Union[List, List[List]]]
+            待修改的特征分箱规则字典。
+            - 数值型特征：传入内部切点列表，如 {'age': [25, 30, 45]} (系统会自动补齐 -inf 和 inf)。
+            - 类别型特征：传入二维分组列表，如 {'city': [['北京', '上海'], ['广州', '深圳'], ['其他']]}。
+        X : DataFrame, optional
+            用于重新计算 WOE 的数据。若为 None，将尝试使用 fit 时缓存的 _cache_X。
+        y : Series, optional
+            目标标签。若为 None，将尝试使用 fit 时缓存的 _cache_y。
+
+        Returns
+        -------
+        pl.DataFrame
+            返回包含所有被修改特征的最新分箱统计分布表（包含 Bad Rate, IV, WOE 等），提供即时反馈。
+        """
+        self._check_is_fitted()
+        
+        # 提取计算上下文
+        calc_X = self._ensure_polars_dataframe(X) if X is not None else self._cache_X
+        calc_y = self._ensure_polars_series(y) if y is not None else self._cache_y
+        
+        if calc_X is None or calc_y is None:
+            raise ValueError(
+                "Missing data for WOE recalculation. "
+                "Either provide X and y explicitly, or ensure the binner cache is not cleared."
+            )
+
+        updated_features = []
+
+        # 遍历更新物理切点状态
+        for feature, splits in bin_rules.items():
+            if feature not in self.feature_names_in_:
+                logger.warning(f"⚠️ Feature '{feature}' is not recognized by this binner. Skipped.")
+                continue
+                
+            # 智能推断类型：如果列表里的元素还是列表，说明是类别型分组；否则是数值型切点
+            is_categorical = len(splits) > 0 and isinstance(splits[0], list)
+
+            if not is_categorical:
+                # 数值型特征：补齐边界并去重排序
+                clean_splits = sorted(list(set(splits)))
+                new_cuts = [float('-inf')] + clean_splits + [float('inf')]
+                self.bin_cuts_[feature] = new_cuts
+            else:
+                # 类别型特征
+                if not hasattr(self, "cat_cuts_"):
+                    self.cat_cuts_ = {}
+                self.cat_cuts_[feature] = splits
+
+            # 清理旧的映射与 WOE 缓存
+            if feature in self.bin_mappings_:
+                del self.bin_mappings_[feature]
+            if feature in self.bin_woes_:
+                del self.bin_woes_[feature]
+
+            updated_features.append(feature)
+
+        if not updated_features:
+            logger.warning("No valid features were updated.")
+            return None
+
+        # 执行即时重算 (Batch 模式)
+        logger.info(f"🔄 Recalculating WOE & stats for {len(updated_features)} modified features...")
+        
+        # 仅截取被更新的特征列送入 profile 引擎，实现单次极速扫描
+        stats_df = self.profile_bin_performance(
+            X=calc_X.select(updated_features), 
+            y=calc_y, 
+            update_woe=True 
+        )
+        
+        return stats_df
+    
+    def prune(self, keep_features: List[str]) -> "MarsBinnerBase":
+        """
+        [Lifecycle] 模型瘦身剪枝。
+        
+        仅保留 `keep_features` 列表中的特征分箱规则，清空其它所有特征的状态，
+        用于在特征筛选结束后极大缩小模型序列化 (Pickle) 后的文件体积。
+        """
+        keep_set = set(keep_features)
+        
+        # 过滤字典
+        self.bin_cuts_ = {k: v for k, v in self.bin_cuts_.items() if k in keep_set}
+        if hasattr(self, "cat_cuts_"):
+            self.cat_cuts_ = {k: v for k, v in self.cat_cuts_.items() if k in keep_set}
+            
+        self.bin_mappings_ = {k: v for k, v in self.bin_mappings_.items() if k in keep_set}
+        self.bin_woes_ = {k: v for k, v in self.bin_woes_.items() if k in keep_set}
+        
+        # 更新输入特征名单
+        self.feature_names_in_ = [f for f in self.feature_names_in_ if f in keep_set]
+        
+        logger.info(f"✂️ Pruned binner down to {len(self.feature_names_in_)} features.")
+        return self
+    
+    def generate_sql(
+        self, 
+        feature: str, 
+        table_prefix: str = "t", 
+        return_type: Literal["woe", "index", "label"] = "woe",
+        map_missing: bool = True,
+        map_special: bool = True
+    ) -> str:
+        """
+        [Deployment] 一键将特征的分箱规则转换为标准 SQL CASE WHEN 语句。
+        
+        Parameters
+        ----------
+        feature : str
+            特征名称。
+        table_prefix : str, default "t"
+            表别名前缀。例如 "t" 会生成 "t.age"。若为空则直接使用特征名。
+        return_type : {'woe', 'index', 'label'}, default 'woe'
+            生成 SQL 的目标值类型：
+            - 'woe': 输出 WOE 浮点数 (适合 LR 逻辑回归模型部署)
+            - 'index': 输出分箱序号 (适合 XGBoost/LightGBM 树模型部署)
+            - 'label': 输出分箱的中文/字符标签 (适合 BI 看板、数据分析或规则引擎)
+        map_missing : bool, default True
+            是否将缺失值映射为对应的 WOE/Index/Label。
+            - 若为 False，则遇到缺失值时直接输出 NULL（极其适合树模型原生处理）。
+        map_special : bool, default True
+            是否将特殊值映射为对应的 WOE/Index/Label。
+            - 若为 False，则遇到特殊值时直接保留原始值（极其适合树模型原生处理）。
+            
+        Returns
+        -------
+        str
+            标准 SQL 脚本。
+        """
+        self._check_is_fitted()
+        if feature not in self.bin_mappings_:
+            raise ValueError(f"Feature '{feature}' not found or not fitted.")
+
+        col_name = f"{table_prefix}.{feature}" if table_prefix else feature
+        lines = [f"CASE"]
+        
+        mappings = self.bin_mappings_.get(feature, {})
+        woes = self.bin_woes_.get(feature, {})
+
+        def _get_output_val(idx: int) -> str:
+            """闭包：根据 return_type 决定 SQL THEN 后面的输出内容"""
+            if return_type == "woe":
+                return f"{woes.get(idx, 0.0):.4f}"
+            elif return_type == "index":
+                return str(idx)
+            else:  # label
+                label_str = mappings.get(idx, "Unknown")
+                return f"'{label_str}'"
+
+        # 1. 缺失值处理 (Missing: -1)
+        if map_missing:
+            lines.append(f"  WHEN {col_name} IS NULL THEN {_get_output_val(self.IDX_MISSING)}")
+        else:
+            # 穿透处理：直接返回 NULL，防止落入 ELSE 兜底分支
+            lines.append(f"  WHEN {col_name} IS NULL THEN NULL")
+            
+        # 2. 特殊值处理 (Special <= -3)
+        special_idx = [k for k in mappings.keys() if k <= self.IDX_SPECIAL_START]
+        for idx in sorted(special_idx, reverse=True):
+            # 从 mappings 里反解出原本的特殊值 (如 "Special_-999" -> "-999")
+            label = mappings[idx]
+            val_str = label.replace("Special_", "")
+            
+            # 格式化特殊值的 SQL 表示（兼容字符串特殊值如 'unknown'）
+            try:
+                float(val_str)
+                sql_val = val_str
+            except ValueError:
+                sql_val = f"'{val_str}'"
+                
+            if map_special:
+                lines.append(f"  WHEN {col_name} = {sql_val} THEN {_get_output_val(idx)}")
+            else:
+                # 穿透处理：遇到特殊值直接返回原字段的值
+                lines.append(f"  WHEN {col_name} = {sql_val} THEN {col_name}")
+
+        # 3. 正常区间处理
+        if feature in self.bin_cuts_:  # 数值型特征
+            cuts = self.bin_cuts_[feature]
+            for i in range(len(cuts) - 1):
+                upper_bound = cuts[i+1]
+                if upper_bound != float('inf'):
+                    lines.append(f"  WHEN {col_name} < {upper_bound} THEN {_get_output_val(i)}")
+                else:
+                    lines.append(f"  ELSE {_get_output_val(i)}")
+                        
+        elif hasattr(self, "cat_cuts_") and feature in self.cat_cuts_:  # 类别型特征
+            groups = self.cat_cuts_[feature]
+            for i, group in enumerate(groups):
+                # 如果分类是 "__Mars_Other_Pre__"，应该跳过并在 ELSE 中处理
+                if "__Mars_Other_Pre__" in group:
+                    continue
+                # 格式化为 IN ('A', 'B')
+                in_clause = ", ".join([f"'{v}'" if isinstance(v, str) else str(v) for v in group])
+                lines.append(f"  WHEN {col_name} IN ({in_clause}) THEN {_get_output_val(i)}")
+            
+            # 兜底 Other (-2)
+            lines.append(f"  ELSE {_get_output_val(self.IDX_OTHER)}")
+
+        # 安全兜底
+        if "ELSE" not in "\n".join(lines):
+            lines.append(f"  ELSE {_get_output_val(self.IDX_OTHER)}")
+            
+        lines.append(f"END AS {feature}_{return_type}")
+        return "\n".join(lines)
+    
+    @staticmethod
+    def _format_cut_point(val: float) -> str:
+        """
+        [Helper] 智能格式化切点数值，彻底杜绝科学计数法，提升图表和 SQL 的观感。
+        """
+        if val == float('inf'): return 'inf'
+        if val == float('-inf'): return '-inf'
+        if val == 0: return '0'
+        
+        abs_val = abs(val)
+        
+        # 1. 超大数字 (>=10000)，使用千分位逗号，如 1,000,000
+        if abs_val >= 10000:
+            if val == int(val):
+                return f"{int(val):,}"
+            else:
+                # 保留两位小数并剔除末尾多余的 0
+                return f"{val:,.2f}".rstrip('0').rstrip('.')
+                
+        # 2. 极小数字 (<0.001)，强制使用定点数避免科学计数法 (如 1e-5 变为 0.00001)
+        # 这里保留 8 位小数，绝大多数风控特征精度已足够，并动态剔除尾部无效的 0
+        elif abs_val < 0.001:
+            return f"{val:.8f}".rstrip('0').rstrip('.')
+            
+        # 3. 常规数字，最多保留 4 位小数并去掉多余的 0
+        else:
+            if val == int(val):
+                return str(int(val))
+            else:
+                return f"{val:.4f}".rstrip('0').rstrip('.')
 
 class MarsNativeBinner(MarsBinnerBase):
     """
