@@ -1,7 +1,7 @@
-# masr/feature/selector.py
+from __future__ import annotations
 import os
 import json
-from typing import List, Optional, Union, Any, Literal, Dict, Tuple
+from typing import List, Optional, Union, Any, Literal, Dict, Tuple, TYPE_CHECKING
 import polars as pl
 import pandas as pd
 import numpy as np
@@ -12,6 +12,9 @@ from mars.feature.binner import MarsNativeBinner, MarsOptimalBinner
 from mars.analysis.report import MarsEvaluationReport
 from mars.utils.logger import logger
 from mars.utils.decorators import time_it
+
+if TYPE_CHECKING:
+    from mars.analysis.evaluator import MarsBinEvaluator
 
 class MarsStatsSelector(MarsBaseSelector):
     """
@@ -566,7 +569,7 @@ class MarsStatsSelector(MarsBaseSelector):
 
         return [f for f in features if f in kept_features_set]
 
-    def get_eval_report(self, X: Union[pl.DataFrame, pd.DataFrame]) -> Tuple["MarsEvaluationReport", any]:
+    def get_eval_report(self, X: Union[pl.DataFrame, pd.DataFrame]) -> Tuple["MarsEvaluationReport", "MarsBinEvaluator"]:
         """
         获取最终入选特征的详细评估报告。
         
@@ -612,6 +615,9 @@ class MarsStatsSelector(MarsBaseSelector):
                 special_values=self.special_values,
                 **self.binning_params
             )
+            
+        if self._return_pandas:
+            evaluator.set_output("pandas")
 
         logger.info(f"📊 Generating final evaluation report for {len(self.selected_features_)} selected features...")
         
@@ -629,9 +635,19 @@ class MarsStatsSelector(MarsBaseSelector):
         输出尸检详细报告。支持 .xlsx 或 .csv 后缀
         """
         report_df = self.get_report()
-        if report_df.height == 0:
-            logger.warning("No report to export.")
-            return
+        # 【修复】兼容 Pandas / Polars 两种判断空表的方法
+        if isinstance(report_df, pd.DataFrame):
+            if report_df.empty:
+                logger.warning("No report to export.")
+                return
+            pd_df = report_df
+        else:
+            if report_df.height == 0:
+                logger.warning("No report to export.")
+                return
+            pd_df = report_df.to_pandas()
+            
+        logger.info(f"💾 Exporting Selection Report to {path}...")
             
         logger.info(f"💾 Exporting Selection Report to {path}...")
         

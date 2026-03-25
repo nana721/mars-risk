@@ -266,6 +266,12 @@ class MarsTransformer(MarsBaseEstimator, TransformerMixin, ABC):
 
     def __sklearn_is_fitted__(self) -> bool:
         return self._is_fitted
+    
+    def _check_is_fitted(self):
+        """[Helper] 检查当前实例是否已完成拟合"""
+        if not self._is_fitted:
+            from mars.core.exceptions import NotFittedError
+            raise NotFittedError(f"{self.__class__.__name__} is not fitted yet. Call 'fit' first.")
 
     def get_feature_names_out(self, input_features=None) -> List[str]:
         return self.feature_names_in_
@@ -306,14 +312,23 @@ class MarsTransformer(MarsBaseEstimator, TransformerMixin, ABC):
         
         支持通过 **kwargs 向 _transform_impl 传递额外参数 (如 return_type)。
         """
-        if not self._is_fitted:
-            raise NotFittedError(f"{self.__class__.__name__} is not fitted.")
+        self._check_is_fitted()
         
         X_pl = self._ensure_polars_dataframe(X)
         X_new = self._transform_impl(X_pl, **kwargs)
         
         # 输出格式化 (Polars -> Pandas/List/Dict)
         return self._format_output(X_new)
+    
+    def fit_transform(
+        self, 
+        X: Union[pl.DataFrame, pd.DataFrame], 
+        y: Optional[Any] = None, **kwargs
+    ) -> Union[pl.DataFrame, pd.DataFrame]:
+        """
+        [API Alignment] 拟合并转换数据 (Scikit-learn 兼容)。
+        """
+        return self.fit(X, y, **kwargs).transform(X)
 
     @abstractmethod
     def _fit_impl(self, X: pl.DataFrame, y=None, **kwargs): 
@@ -382,7 +397,19 @@ class MarsBaseSelector(MarsBaseEstimator, ABC):
         if self.target in X.columns and self.target not in cols_to_keep:
             cols_to_keep.append(self.target)
             
-        return X.select(cols_to_keep)
+        X_out = X.select(cols_to_keep)
+        return self._format_output(X_out)
+    
+    def fit_transform(
+        self, 
+        X: Union[pl.DataFrame, pd.DataFrame], 
+        y: Optional[Any] = None, 
+        **kwargs
+    ) -> Union[pl.DataFrame, pd.DataFrame]:
+        """
+        [API Alignment] 拟合并转换数据 (Scikit-learn 兼容)。
+        """
+        return self.fit(X, y, **kwargs).transform(X)
 
     def get_report(self) -> pl.DataFrame:
         """
@@ -411,7 +438,9 @@ class MarsBaseSelector(MarsBaseEstimator, ABC):
         })
         
         # 按照 状态(Dropped优先) -> 阶段 -> 特征名 排序
-        return report_df.sort(["status", "stage", "feature"], descending=[False, False, False])
+        sorted_report = report_df.sort(["status", "stage", "feature"], descending=[False, False, False])
+        # 【修复】通过格式化输出保证双引擎兼容
+        return self._format_output(sorted_report)
 
     def _register_decision(
         self, 
