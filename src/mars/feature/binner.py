@@ -43,20 +43,11 @@ class MarsBinnerBase(MarsTransformer):
 
     Notes
     -----
-    1. 极致性能架构: 
-    底层完全基于 Polars 的表达式引擎 (Expression Engine)。在转换数千个特征时, 基类会自动
-    构建一个平坦化的计算图, 通过单次 IO 扫描实现并行转换, 规避了 Pandas 逐列循环的性能瓶颈。
-
-    2. 索引协议 (Index Protocol): 
-    系统强制执行统一的索引协议以支持下游的风险监控 (PSI/IV): 
+    索引协议 (Index Protocol): 
     - `Missing`: -1
     - `Other`: -2
     - `Special`: -3, -4, ...
     - `Normal`: 0, 1, 2, ...
-
-    3. 内存与稳定性: 
-    内置“延迟物化 (Lazy Materialization)”与“分批执行 (Batch Execution)”机制, 
-    确保在处理千万级数据或超宽表时, 内存曲线保持平稳, 防止因计算图深度溢出导致的系统崩溃。
     """
 
     # 类型常量: 用于快速判定数值列
@@ -109,7 +100,7 @@ class MarsBinnerBase(MarsTransformer):
 
         Notes
         -----
-        初始化阶段不执行任何重型计算。所有计算资源 (进程池、线程池)均在 `fit` 阶段按需按需申请。
+        初始化阶段不执行任何重型计算。所有计算资源 (进程池、线程池) 均在 `fit` 阶段按需按需申请。
         """
         super().__init__()
         self.features = features if features is not None else []
@@ -157,7 +148,7 @@ class MarsBinnerBase(MarsTransformer):
     @classmethod
     def from_dict(cls, data: Dict[str, Any]):
         """
-        从字典中恢复分箱器实例。
+        从典中恢复分箱器实例。
         """
         # 实例化一个空对象
         instance = cls(**data["params"])
@@ -199,9 +190,10 @@ class MarsBinnerBase(MarsTransformer):
             self._cache_y = None
             
     def clear_cache(self):
+        """手动清理训练数据缓存。建议在模型训练完成后调用, 以释放内存。"""
         self._cache_X = None
         self._cache_y = None
-        gc.collect() # 显式触发回收
+        gc.collect() 
 
     def _get_safe_values(self, dtype: pl.DataType, values: List[Any]) -> List[Any]:
         """
@@ -288,8 +280,10 @@ class MarsBinnerBase(MarsTransformer):
         total_goods = len(y_series) - total_bads
         
         # 涵盖数值和类别特征
-        bin_cols_orig = [c for c in self.bin_cuts_.keys()] + \
-                        (list(self.cat_cuts_.keys()) if hasattr(self, 'cat_cuts_') else [])
+        bin_cols_orig = [
+            c for c in self.bin_cuts_.keys()] + (list(self.cat_cuts_.keys()) 
+            if hasattr(self, 'cat_cuts_') else []
+        )
 
         for i in range(0, len(bin_cols_orig), batch_size):
             batch_features = bin_cols_orig[i: i + batch_size]
@@ -542,11 +536,12 @@ class MarsBinnerBase(MarsTransformer):
                 layer_missing = pl.when(missing_cond).then(pl.lit(IDX_MISSING, dtype=pl.Int16))
                 
                 # 特殊值
-                current_branch = pl.lit(IDX_OTHER, dtype=pl.Int16)
+                current_branch = pl.lit(default_bin_idx, dtype=pl.Int16)
                 if safe_special_vals:
                     for i in range(len(safe_special_vals)-1, -1, -1):
                         v = safe_special_vals[i]
                         idx = IDX_SPECIAL_START - i
+                        # 如果是特殊值则赋予 -3，否则掉入上一层的 current_branch (即 default_bin_idx)
                         current_branch = (
                             pl.when(target_col == str(v))
                             .then(pl.lit(idx, dtype=pl.Int16))
@@ -624,6 +619,8 @@ class MarsBinnerBase(MarsTransformer):
 
     @staticmethod
     def _detect_trend_scientific(woes: List[float]) -> str:
+        """基于差分的严格单调性与峰谷检测"""
+        
         y = np.array([w for w in woes if w is not None and not np.isnan(w)])
         n = len(y)
         
@@ -1109,9 +1106,9 @@ class MarsBinnerBase(MarsTransformer):
                 return f"{val:,.2f}".rstrip('0').rstrip('.')
                 
         # 2. 极小数字 (<0.001)，强制使用定点数避免科学计数法 (如 1e-5 变为 0.00001)
-        # 这里保留 8 位小数，绝大多数风控特征精度已足够，并动态剔除尾部无效的 0
+        # 这里保留 6 位小数，绝大多数风控特征精度已足够，并动态剔除尾部无效的 0
         elif abs_val < 0.001:
-            return f"{val:.8f}".rstrip('0').rstrip('.')
+            return f"{val:.6f}".rstrip('0').rstrip('.')
             
         # 3. 常规数字，最多保留 4 位小数并去掉多余的 0
         else:
@@ -1768,7 +1765,8 @@ class MarsOptimalBinner(MarsBinnerBase):
         monotonic_trend: Literal["ascending", "descending", "auto", "auto_asc_desc"] = "auto_asc_desc",
         solver: Literal["cp", "mip"] = "cp",
         time_limit: int = 10,
-        cat_cutoff: Optional[int] = 100,
+        max_cats_to_solver: Optional[int] = 100,  
+        min_cat_fraction: float = 0.05,           
         special_values: Optional[List[Any]] = None,
         missing_values: Optional[List[Any]] = None,
         cart_params: Optional[Dict[str, Any]] = None,
@@ -1822,10 +1820,12 @@ class MarsOptimalBinner(MarsBinnerBase):
         time_limit: int, default=10
             **求解超时时间** (秒)。
             单个特征的最优分箱求解最大允许耗时。若超时, 将自动回退。
-        cat_cutoff: int, optional, default=100
+        max_cats_to_solver: int, optional, default=100
             **类别特征高基数截断阈值**。
             对于类别型特征, 仅保留出现频率最高的 Top-K 个类别, 其余类别将被归并为 
             `"__Mars_Other_Pre__"`, 以减少求解器的搜索空间。
+        min_cat_fraction: float, optional, default=0.05
+            **类别特征最小占比约束**。
         special_values: List[Any], optional
             **特殊值列表**。
             这些值 (如 -999, -1)将被强制剥离, 分配到独立的负数索引分箱中 (-3, -4...), 
@@ -1864,7 +1864,8 @@ class MarsOptimalBinner(MarsBinnerBase):
         self.monotonic_trend = monotonic_trend
         self.solver = solver
         self.time_limit = time_limit
-        self.cat_cutoff = cat_cutoff
+        self.max_cats_to_solver = max_cats_to_solver
+        self.min_cat_fraction = min_cat_fraction
         self.cart_params = cart_params if cart_params is not None else {}
             
         self.OptimalBinning = OptimalBinning
@@ -2148,27 +2149,20 @@ class MarsOptimalBinner(MarsBinnerBase):
         """
         raw_exclude = self.special_values + self.missing_values
         
-        def cat_worker(col: str, clean_data: np.ndarray, clean_y: np.ndarray) -> Tuple[str, Optional[List[List[Any]]], Optional[str]]:
+        def cat_worker(
+            col: str, 
+            clean_data: np.ndarray, 
+            clean_y: np.ndarray
+        ) -> Tuple[str, Optional[List[List[Any]]], Optional[str]]:
             try:
-                # Top-K 预处理: 将长尾类别归为 "__Mars_Other_Pre__"
-                if self.cat_cutoff is not None:
-                    unique_vals, counts = np.unique(clean_data, return_counts=True)
-                    if len(unique_vals) > self.cat_cutoff:
-                        top_indices = np.argsort(-counts)[:self.cat_cutoff]
-                        top_vals = set(unique_vals[top_indices])
-                        mask_keep = np.isin(clean_data, list(top_vals))
-                        # [隐式契约] 
-                        # "__Mars_Other_Pre__" 这个特殊字符串必须与 MarsBinnerBase.transform 中的默认路由逻辑保持一致。
-                        # 这里的归并操作对应 Transform 阶段的 "Other" (-2) 索引。
-                        clean_data = np.where(mask_keep, clean_data, "__Mars_Other_Pre__")
-
                 opt = self.OptimalBinning(
-                    name=col, dtype="categorical", solver=self.solver,
+                    name=col, dtype="categorical", 
+                    solver=self.solver,
                     max_n_bins=self.n_bins, 
                     time_limit=self.time_limit,
-                    cat_cutoff=0.05, 
+                    cat_cutoff=self.min_cat_fraction,  
                     verbose=False
-               )
+                )
                 opt.fit(clean_data, clean_y)
                 
                 if opt.status in ["OPTIMAL", "FEASIBLE"]:
@@ -2177,25 +2171,22 @@ class MarsOptimalBinner(MarsBinnerBase):
             except Exception as e:
                 return col, None, f"{type(e).__name__}: {str(e)}"
 
-        
         def cat_task_gen():
             for c in cat_cols:
                 series = X.get_column(c)
                 col_dtype = series.dtype
                 
-                if self.cat_cutoff is not None:
-                    # 计算 Value Counts
-                    top_k_df = series.value_counts(sort=True).head(self.cat_cutoff)
+                # [核心提速] Top-K 预处理使用 Polars 原生操作
+                if self.max_cats_to_solver is not None:
+                    top_k_df = series.value_counts(sort=True).head(self.max_cats_to_solver)
                     top_vals = top_k_df.get_column(c)
                     
-                    # 只有在 top_k 里的才保留，否则置为 Other
-                    # [优化] pl.when 返回的是 Expr，必须立即 execute 变回 Series
-                    # 这里利用 X 上下文进行快速 select
-                    series = X.select(
-                        pl.when(pl.col(c).is_in(top_vals))
-                        .then(pl.col(c))
+                    # 优化：直接在 Series 上使用 when.then.otherwise，比 X.select 更简洁高效
+                    series = (
+                        pl.when(series.is_in(top_vals))
+                        .then(series)
                         .otherwise(pl.lit("__Mars_Other_Pre__"))
-                    ).to_series()
+                    )
                 
                 # 获取该列的安全排除列表
                 safe_exclude = self._get_safe_values(col_dtype, raw_exclude)
@@ -2211,14 +2202,16 @@ class MarsOptimalBinner(MarsBinnerBase):
                     continue
                 
                 valid_mask_np = valid_mask.to_numpy() # 预转 Numpy 掩码
+                # 强制转为 Utf8 确保传给 optbinning 的绝对是字符串
                 col_data = clean_series.cast(pl.Utf8).to_numpy()
-                clean_y = y_np[valid_mask_np] # 使用预转好的 mask
+                clean_y = y_np[valid_mask_np]
 
                 yield c, col_data, clean_y
 
+
         results = Parallel(n_jobs=self.n_jobs, backend="loky")(
             delayed(cat_worker)(c, data, y) for c, data, y in cat_task_gen()
-       )
+        )
         
         for col, splits, error_msg in results:
             if splits is not None:
