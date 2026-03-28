@@ -1020,7 +1020,7 @@ class MarsBinnerBase(MarsTransformer):
         woes = self.bin_woes_.get(feature, {})
 
         def _get_output_val(idx: int) -> str:
-            """闭包：根据 return_type 决定 SQL THEN 后面的输出内容"""
+            """闭包内部函数：根据输出契约动态格式化 THEN 后置结果"""
             if return_type == "woe":
                 return f"{woes.get(idx, 0.0):.4f}"
             elif return_type == "index":
@@ -1029,57 +1029,58 @@ class MarsBinnerBase(MarsTransformer):
                 label_str = mappings.get(idx, "Unknown")
                 return f"'{label_str}'"
 
-        # 1. 缺失值处理 (Missing: -1)
+        # 处理缺失值映射，支持原生 NULL 穿透以便树模型识别默认分裂方向
         if map_missing:
             lines.append(f"  WHEN {col_name} IS NULL THEN {_get_output_val(self.IDX_MISSING)}")
         else:
-            # 穿透处理：直接返回 NULL，防止落入 ELSE 兜底分支
             lines.append(f"  WHEN {col_name} IS NULL THEN NULL")
             
-        # 2. 特殊值处理 (Special <= -3)
+        # 迭代特殊值分箱，通过逆序处理确保特殊值优先于正常区间被拦截
         special_idx = [k for k in mappings.keys() if k <= self.IDX_SPECIAL_START]
         for idx in sorted(special_idx, reverse=True):
-            # 从 mappings 里反解出原本的特殊值 (如 "Special_-999" -> "-999")
+            # 从分箱标签中解析出原始特殊值标识
             label = mappings[idx]
             val_str = label.replace("Special_", "")
             
-            # 格式化特殊值的 SQL 表示（兼容字符串特殊值如 'unknown'）
+            # 执行类型嗅探，确保数值型特殊值不加引号，字符型特殊值合法闭合
             try:
                 float(val_str)
                 sql_val = val_str
             except ValueError:
                 sql_val = f"'{val_str}'"
                 
+            # 若 map_special 为 False 则直接穿透原始值，适合树模型寻找特定异常点的分裂力
             if map_special:
                 lines.append(f"  WHEN {col_name} = {sql_val} THEN {_get_output_val(idx)}")
             else:
-                # 穿透处理：遇到特殊值直接返回原字段的值
                 lines.append(f"  WHEN {col_name} = {sql_val} THEN {col_name}")
 
-        # 3. 正常区间处理
-        if feature in self.bin_cuts_:  # 数值型特征
+        # 处理数值型特征切点逻辑
+        if feature in self.bin_cuts_:
             cuts = self.bin_cuts_[feature]
             for i in range(len(cuts) - 1):
                 upper_bound = cuts[i+1]
+                # 利用 CASE WHEN 顺序匹配的短路特性，通过左闭右开区间进行层级划分
                 if upper_bound != float('inf'):
                     lines.append(f"  WHEN {col_name} < {upper_bound} THEN {_get_output_val(i)}")
                 else:
                     lines.append(f"  ELSE {_get_output_val(i)}")
                         
-        elif hasattr(self, "cat_cuts_") and feature in self.cat_cuts_:  # 类别型特征
+        # 处理类别型特征的分组枚举逻辑
+        elif hasattr(self, "cat_cuts_") and feature in self.cat_cuts_:
             groups = self.cat_cuts_[feature]
             for i, group in enumerate(groups):
-                # 如果分类是 "__Mars_Other_Pre__"，应该跳过并在 ELSE 中处理
+                # 跳过长尾预处理标识，统一由末尾的 ELSE 逻辑进行归并
                 if "__Mars_Other_Pre__" in group:
                     continue
-                # 格式化为 IN ('A', 'B')
+                # 构造 IN 表达式，将具有相似 WOE 表现的类别聚合为逻辑分组
                 in_clause = ", ".join([f"'{v}'" if isinstance(v, str) else str(v) for v in group])
                 lines.append(f"  WHEN {col_name} IN ({in_clause}) THEN {_get_output_val(i)}")
             
-            # 兜底 Other (-2)
+            # 将未见类别统一路由至 Other 分箱索引
             lines.append(f"  ELSE {_get_output_val(self.IDX_OTHER)}")
 
-        # 安全兜底
+        # 针对无默认 ELSE 路径的情况执行兜底，防止 SQL 语句非法
         if "ELSE" not in "\n".join(lines):
             lines.append(f"  ELSE {_get_output_val(self.IDX_OTHER)}")
             
@@ -1097,7 +1098,7 @@ class MarsBinnerBase(MarsTransformer):
         
         abs_val = abs(val)
         
-        # 1. 超大数字 (>=10000)，使用千分位逗号，如 1,000,000
+        # 超大数字 (>=10000)，使用千分位逗号，如 1,000,000
         if abs_val >= 10000:
             if val == int(val):
                 return f"{int(val):,}"
@@ -1105,12 +1106,11 @@ class MarsBinnerBase(MarsTransformer):
                 # 保留两位小数并剔除末尾多余的 0
                 return f"{val:,.2f}".rstrip('0').rstrip('.')
                 
-        # 2. 极小数字 (<0.001)，强制使用定点数避免科学计数法 (如 1e-5 变为 0.00001)
-        # 这里保留 6 位小数，绝大多数风控特征精度已足够，并动态剔除尾部无效的 0
+        # 极小数字 (<0.001)，强制使用定点数避免科学计数法, 保留 6 位小数，并动态剔除尾部无效的 0
         elif abs_val < 0.001:
             return f"{val:.6f}".rstrip('0').rstrip('.')
             
-        # 3. 常规数字，最多保留 4 位小数并去掉多余的 0
+        # 常规数字，最多保留 4 位小数并去掉多余的 0
         else:
             if val == int(val):
                 return str(int(val))
@@ -1147,11 +1147,13 @@ class MarsNativeBinner(MarsBinnerBase):
         self,
         features: Optional[List[str]] = None,
         *,
+        cat_features: Optional[List[str]] = None, # ✅ 新增 cat_features
         method: Literal["cart", "quantile", "uniform"] = "cart",
         n_bins: int = 10,
         special_values: Optional[List[Union[int, float, str]]] = None,
         missing_values: Optional[List[Union[int, float, str]]] = None,
         min_bin_size: float = 0.02,
+        merge_small_bins: bool = False, # ✅ 新增：是否开启原生分箱的强制合并
         cart_params: Optional[Dict[str, Any]] = None,
         remove_empty_bins: bool = False,
         n_jobs: int = -1,
@@ -1185,119 +1187,248 @@ class MarsNativeBinner(MarsBinnerBase):
         """
         super().__init__(
             features=features, n_bins=n_bins, 
-            special_values=special_values, missing_values=missing_values,
+            cat_features=cat_features, # ✅ 传递给父类
+            special_values=special_values, 
+            missing_values=missing_values,
             n_jobs=n_jobs
        )
         self.method = method
         self.min_bin_size = min_bin_size
+        self.merge_small_bins = merge_small_bins # ✅ 挂载到实例
         self.remove_empty_bins = remove_empty_bins
         
         self.cart_params = cart_params if cart_params is not None else {}
 
     def _fit_impl(self, X: pl.DataFrame, y: Optional[Any] = None) -> None:
         """
-        执行分箱拟合的核心入口逻辑。
+        [Core Dispatcher] 原生分箱核心拟合与路由引擎。
 
-        负责任务分发前的三道防线: 
-        1. 自动识别并排除非数值列。
-        2. 极速全表扫描获取 Min/Max, 识别并排除常量列。
-        3. 路由分发至不同的分箱策略方法。
+        该方法充当整个分箱流程的“交通指挥枢纽”。它通过一次完整的 Schema 扫描，
+        将特征划分为三大阵营（全空、数值、类别），并自动过滤掉零方差特征，
+        最后将有效特征分发给对应的底层算法进行拟合。
 
         Parameters
         ----------
-        X: polars.DataFrame
-            经过基类归一化后的训练数据。
-        y: polars.Series, optional
-            目标变量。在使用 'cart' 方法时必填。
+        X : pl.DataFrame
+            训练数据集 (特征矩阵)。
+        y : Optional[Any], default None
+            目标变量 (Label)。
+            - 无监督分箱 (quantile, uniform, categorical) 时可为 None。
+            - 有监督分箱 (cart) 时必须提供。
+
+        Process Flow
+        ------------
+        1. **特征探查与分流**:
+           - 全空列 (Null): 直接赋予空切点，安全熔断。
+           - 类别列 (Categorical/String/Bool): 放入 `cat_cols` 队列。
+           - 数值列 (Numeric): 放入 `num_cols` 队列。
+        2. **零方差前置拦截 (Numeric)**:
+           - 向量化极速提取所有数值列的 `min` 和 `max`。
+           - 拦截 `min == max` (单一值) 的特征，直接赋予 `[-inf, inf]` 兜底。
+        3. **算法分发**:
+           - 数值列分发至 `_fit_quantile`, `_fit_uniform`, 或 `_fit_cart_parallel`。
+           - 类别列分发至 `_fit_categorical_native`。
+        4. **异常容错**:
+           - 捕获无法分箱的特征并存入 `self.fit_failures_`，不阻塞全局流程。
         """
-        # 缓存数据引用, 仅用于 transform 阶段请求 return_type='woe' 时的延迟计算
         self._cache_X = X
         self._cache_y = y
+        self.fit_failures_: Dict[str, str] = {}
 
-        # 确定目标列 (仅筛选数值列, 忽略全空列)
-        # 获取 y 的名称 (如果 y 是 Series)
         y_name = getattr(y, "name", None)
-        
-        # 确定目标列: 如果没有指定 features, 则获取 X 的所有列, 但必须排除掉 y 所在的列
-        if not self.features:
-            all_target_cols = [c for c in X.columns if c != y_name]
-        else:
-            all_target_cols = self.features
-        target_cols: List[str] = []
-        null_cols: List[str] = [] 
+        all_target_cols = self.features if self.features else [c for c in X.columns if c != y_name]
+        cat_set = set(self.cat_features) if self.cat_features else set()
+
+        num_cols = []
+        cat_cols = []
+        null_cols = [] 
 
         for c in all_target_cols:
             if c not in X.columns: continue
             
-            # 判定全空/Null类型列, 记录下来以便直接注册为空箱
+            # 判定全空
             if X[c].dtype == pl.Null or X[c].null_count() == X.height:
                 null_cols.append(c)
                 continue
 
-            # 仅处理数值类型
-            if self._is_numeric(X[c]):
-                target_cols.append(c)
+            # ✅ 分流：类别 vs 数值
+            if c in cat_set or X[c].dtype in [pl.Utf8, pl.Categorical, pl.Boolean]:
+                cat_cols.append(c)
+            elif self._is_numeric(X[c]):
+                num_cols.append(c)
 
-        # 注册全空列为空切点, 防止 transform 时漏列
         for c in null_cols:
             self.bin_cuts_[c] = []
 
-        if not target_cols:
-            if not null_cols:
-                logger.warning("No numeric columns found for binning.")
+        if not num_cols and not cat_cols:
+            logger.warning("No valid columns found for binning.")
             return
 
-        # 全表扫描获取 Min/Max, 识别常量列
-        valid_cols: List[str] = []
-        stats_exprs = []
-        for c in target_cols:
-            col_dtype = X.schema[c]
-            target_expr = pl.col(c)
+        # ---------------- 1. 处理数值型特征 ----------------
+        if num_cols:
+            valid_num_cols = []
+            stats_exprs = []
+            for c in num_cols:
+                col_dtype = X.schema[c]
+                target_expr = pl.col(c)
+                if col_dtype in [pl.Float32, pl.Float64]:
+                    target_expr = target_expr.filter(target_expr.is_not_nan())
+                stats_exprs.append(target_expr.min().alias(f"{c}_min"))
+                stats_exprs.append(target_expr.max().alias(f"{c}_max"))
             
-            # [优化] 只有浮点数才做 is_not_nan 检查
-            if col_dtype in [pl.Float32, pl.Float64]:
-                target_expr = target_expr.filter(target_expr.is_not_nan())
+            stats_row = X.select(stats_exprs).row(0)
+            
+            for i, c in enumerate(num_cols):
+                min_val, max_val = stats_row[i * 2], stats_row[i * 2 + 1]
+                if min_val == max_val:
+                    self.bin_cuts_[c] = [float('-inf'), float('inf')]
+                    continue
+                valid_num_cols.append(c)
                 
-            stats_exprs.append(target_expr.min().alias(f"{c}_min"))
-            stats_exprs.append(target_expr.max().alias(f"{c}_max"))
-        stats_row = X.select(stats_exprs).row(0)
-        
-        for i, c in enumerate(target_cols):
-            min_val = stats_row[i * 2]
-            max_val = stats_row[i * 2 + 1]
-            
-            # 如果 Min == Max, 说明是常量列, 无需分箱, 直接设为全区间
-            if min_val == max_val:
-                logger.warning(f"Feature '{c}' is constant. Skipped.")
-                self.bin_cuts_[c] = [float('-inf'), float('inf')]
-                continue
-            valid_cols.append(c)
-            
-        if not valid_cols:
-            return
+            if valid_num_cols:
+                if y is None and self.method == "cart":
+                    raise ValueError("Decision Tree Binning ('cart') requires target 'y'.")
+                
+                if self.method == "quantile":
+                    self._fit_quantile(X, valid_num_cols)
+                elif self.method == "uniform":
+                    self._fit_uniform(X, valid_num_cols)
+                elif self.method == "cart":
+                    self._fit_cart_parallel(X, y, valid_num_cols)
+                    
+                # ✅ [修复] CART 自带 min_samples_leaf 约束，绝不能事后干预破坏最优切点！
+                # 只有机械切分的 quantile 和 uniform 才需要执行事后贪心合并
+                if self.merge_small_bins and self.method in ["quantile", "uniform"]:
+                    self._apply_min_bin_size(X, valid_num_cols)
 
-        # 检查 CART 方法的依赖
-        if y is None and self.method == "cart":
-            raise ValueError("Decision Tree Binning ('cart') requires target 'y'.")
-        
-        # 初始化失败记录器
-        self.fit_failures_: Dict[str, str] = {}
+        # ---------------- 2. ✅ 处理类别型特征 ----------------
+        if cat_cols:
+            self._fit_categorical_native(X, cat_cols)
 
-        # 策略分发
-        if self.method == "quantile":
-            self._fit_quantile(X, valid_cols)
-        elif self.method == "uniform":
-            self._fit_uniform(X, valid_cols)
-        elif self.method == "cart":
-            self._fit_cart_parallel(X, y, valid_cols)
-        else:
-            raise ValueError(f"Unknown method: {self.method}")
-        
-        if hasattr(self, "fit_failures_") and self.fit_failures_:
+        if self.fit_failures_:
             logger.warning(
-                f"⚠️ {len(self.fit_failures_)} numeric features are degenerate (single bin). "
+                f"⚠️ {len(self.fit_failures_)} features failed and fallbacked. "
                 f"Check `.fit_failures_` for details."
-           )
+            )
+    
+    def _apply_min_bin_size(self, X: pl.DataFrame, valid_num_cols: List[str]) -> None:
+        """
+        [Algorithm] 单趟 CDF 前向贪心合并 (One-Pass CDF Greedy Merge).
+        
+        用于消除等频/等宽分箱产生的、样本占比小于 min_bin_size 的微型碎片箱。
+        """
+        if not self.merge_small_bins or self.min_bin_size <= 0:
+            return
+            
+        raw_exclude = self.special_values + self.missing_values
+
+        for col in valid_num_cols:
+            raw_cuts = self.bin_cuts_.get(col, [])
+            if len(raw_cuts) <= 2:
+                continue # 只有 [-inf, inf] 兜底，无需合并
+            
+            # 取出中间切点
+            inner_cuts = sorted(raw_cuts[1:-1])
+            
+            # --- 1. 获取剔除特殊值/空值后的干净数据 ---
+            col_dtype = X.schema[col]
+            safe_exclude = self._get_safe_values(col_dtype, raw_exclude)
+            
+            series = X.get_column(col)
+            valid_mask = series.is_not_null()
+            if col_dtype in [pl.Float32, pl.Float64]:
+                valid_mask &= series.is_not_nan()
+            if safe_exclude:
+                valid_mask &= ~series.is_in(safe_exclude)
+            
+            clean_series = series.filter(valid_mask)
+            total_valid = clean_series.len()
+            
+            if total_valid == 0:
+                continue
+                
+            # --- 2. 向量化极速计算 CDF ---
+            # 构造表达式：每个切点包含的样本数
+            exprs = [(pl.col(col) <= c).sum().alias(f"cut_{i}") for i, c in enumerate(inner_cuts)]
+            
+            # 一次 Select 查出所有切点的 CDF 占比
+            cdf_row = clean_series.to_frame().select(exprs).row(0)
+            cdf_vals = [val / total_valid for val in cdf_row]
+            
+            # --- 3. 前向贪心合并逻辑 ---
+            kept_cuts = []
+            last_cdf = 0.0
+            
+            for cut_val, cdf in zip(inner_cuts, cdf_vals):
+                # 只有当当前切点与上一个保留切点的区间占比达标时，才保留该切点
+                if cdf - last_cdf >= self.min_bin_size:
+                    kept_cuts.append(cut_val)
+                    last_cdf = cdf
+                    
+            # --- 4. 尾部反悔机制 (Tail Check) ---
+            # 最后一个箱子的占比是 1.0 - last_cdf
+            if kept_cuts and (1.0 - last_cdf < self.min_bin_size):
+                # 尾部不达标，直接踢掉最后一个保留切点，它会自动与倒数第二个箱子合并
+                # 且数学上保证：合并后的新尾部占比必然 >= min_bin_size
+                kept_cuts.pop()
+                
+            # 重新装载合并后的切点
+            self.bin_cuts_[col] = [float('-inf')] + kept_cuts + [float('inf')]
+
+    def _fit_categorical_native(self, X: pl.DataFrame, cols: List[str]) -> None:
+        """
+        [Algorithm] 类别特征极速分箱 (Top-N Truncation)。
+
+        这是针对高基数类别特征（High Cardinality Categorical Features）的极速降维算法。
+        它基于频率统计，保留样本量最大的 Top-K 个类别独立成箱，其余长尾类别予以截断。
+
+        Parameters
+        ----------
+        X : pl.DataFrame
+            训练数据集。
+        cols : List[str]
+            被判定为类别型的特征列表。
+
+        Architectural Note (架构精要)
+        -----------------------------
+        1. **参数复用**: 这里的 `K` 值直接复用基类的 `self.n_bins` (即最大箱数)。
+        2. **隐式长尾归集**: 本方法只需将 Top-K 类别写入 `self.cat_cuts_`。
+           在 `transform` 阶段，任何未命中 `cat_cuts_` 字典的长尾类别（或新出现的类别），
+           都会极其优雅地触发基类的 `otherwise(default_bin)` 机制，
+           自动跌入 `IDX_OTHER` (-2) 兜底箱中，无需在 fit 阶段手动将它们替换为 "Other"。
+        """
+        if not hasattr(self, "cat_cuts_"):
+            self.cat_cuts_ = {}
+            
+        raw_exclude = self.special_values + self.missing_values
+        
+        for c in cols:
+            col_dtype = X.schema[c]
+            safe_exclude = self._get_safe_values(col_dtype, raw_exclude)
+            
+            series = X.get_column(c)
+            
+            # 构建过滤掩码：剔除空值与业务指定的特殊值
+            valid_mask = series.is_not_null()
+            if safe_exclude:
+                valid_mask &= (~series.is_in(safe_exclude))
+                
+            clean_series = series.filter(valid_mask)
+            
+            # 异常熔断：全部是空值或特殊值
+            if clean_series.len() == 0:
+                self.fit_failures_[c] = "All values are missing or special."
+                self.cat_cuts_[c] = []
+                continue
+                
+            # 核心：使用 Polars 极速统计频次，取前 n_bins 个
+            # 例如 n_bins=10，则保留最多 10 个独立类别
+            top_k_df = clean_series.value_counts(sort=True).head(self.n_bins)
+            top_vals = top_k_df.get_column(c).to_list()
+            
+            # cat_cuts_ 要求是二维列表 (List[List[Any]])，每个子列表代表一个箱
+            # 这里为每个 Top 类别分配一个独立的箱
+            self.cat_cuts_[c] = [[val] for val in top_vals]
 
     def _fit_quantile(self, X: pl.DataFrame, cols: List[str]) -> None:
         """
@@ -2181,12 +2312,11 @@ class MarsOptimalBinner(MarsBinnerBase):
                     top_k_df = series.value_counts(sort=True).head(self.max_cats_to_solver)
                     top_vals = top_k_df.get_column(c)
                     
-                    # 优化：直接在 Series 上使用 when.then.otherwise，比 X.select 更简洁高效
-                    series = (
-                        pl.when(series.is_in(top_vals))
-                        .then(series)
+                    series = X.select(
+                        pl.when(pl.col(c).is_in(top_vals))
+                        .then(pl.col(c))
                         .otherwise(pl.lit("__Mars_Other_Pre__"))
-                    )
+                    ).to_series()
                 
                 # 获取该列的安全排除列表
                 safe_exclude = self._get_safe_values(col_dtype, raw_exclude)

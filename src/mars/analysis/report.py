@@ -22,21 +22,48 @@ class ProfileData(NamedTuple):
 
 class MarsProfileReport:
     """
-    [报告容器] MarsProfileReport - 统一管理数据画像结果的展示与导出。
-    
-    该类作为 MarsDataProfiler 的输出容器，负责将原始的统计数据 (DataFrame)
-    转换为适合阅读分析的格式。它支持两种主要的输出渠道：
-    1. **Jupyter Notebook**: 生成富文本 HTML，包含交互式表格、热力图和迷你分布图。
-    2. **Excel 文件**: 导出带格式 (条件格式、数据条、百分比) 的 Excel 报表。
+    由 MarsDataProfiler 生成的数据画像报告容器。
+
+    该类作为数据探查 (EDA) 流程的最终输出枢纽，负责统一管理特征统计指标与数据质量 (DQ) 指标的
+    展示、交互与导出。它无缝连接了底层纯粹的分析数据与业务级可视化报表。
+
+    核心特性
+    --------
+    * **交互式探查 (Interactive EDA)**: 在 Jupyter Notebook 中渲染富文本 HTML，
+      支持嵌入式迷你分布图 (Sparklines)、热力图色阶与动态数据表。
+    * **企业级导出 (Professional Export)**: 一键生成符合业务阅读直觉的 Excel 监控报表，
+      并原生保留所有条件格式 (Conditional Formatting)、数据条与百分比刻度。
+    * **趋势追踪 (Trend Tracking)**: 管理按时间切片或客群维度展开的多维分析结果，
+      通过统一的 API 快速下钻追踪特定指标的演变趋势。
 
     Attributes
     ----------
     overview_table : Union[pl.DataFrame, pd.DataFrame]
-        全量概览大宽表，包含所有特征的统计指标。
+        全量特征概览宽表。包含所有特征的全局数据质量与统计分布表现 (如 missing_rate, mean 等)。
     dq_tables : Dict[str, Union[pl.DataFrame, pd.DataFrame]]
-        数据质量 (DQ) 指标的分组趋势表字典，key 为指标名 (如 'missing')。
+        数据质量 (DQ) 指标的分组趋势字典。
+        - Key: 指标名称 (如 'missing', 'zeros', 'unique')。
+        - Value: 该指标在不同时间切片/分组下的透视宽表 (Pivot Table)。
     stats_tables : Dict[str, Union[pl.DataFrame, pd.DataFrame]]
-        统计指标的分组趋势表字典，key 为指标名 (如 'mean')。
+        统计分布指标的分组趋势字典。
+        - Key: 指标名称 (如 'mean', 'max', 'p25')。
+        - Value: 该指标在不同时间切片/分组下的透视宽表 (Pivot Table)。
+
+    Examples
+    --------
+    >>> from mars.analysis import MarsDataProfiler
+    >>> profiler = MarsDataProfiler(df)
+    >>> report = profiler.generate_profile(profile_by="month")
+    >>> 
+    >>> # 1. 在 Jupyter 中进行交互式展示
+    >>> report.show_overview(sort_by="missing_rate")
+    >>> report.show_trend("missing", features=["age", "income"])
+    >>> 
+    >>> # 2. 提取底层干净的分析数据进行二次开发
+    >>> overview_df, dq_dict, stat_dict = report.get_profile_data()
+    >>> 
+    >>> # 3. 导出为带高亮业务样式的 Excel 报表
+    >>> report.write_excel("mars_data_health_audit.xlsx")
     """
 
     def __init__(
@@ -75,7 +102,7 @@ class MarsProfileReport:
         dq_keys = list(self.dq_tables.keys())
         stat_keys = list(self.stats_tables.keys())
 
-        # --- 样式定义 (Inline CSS for portability) ---
+        # 样式定义 (Inline CSS for portability)
         # 胶囊样式，用于包裹指标名
         pill_style = (
             "background-color: #e8f4f8; color: #2980b9; border: 1px solid #bce0eb; "
@@ -87,7 +114,7 @@ class MarsProfileReport:
             "font-family: monospace; color: #e74c3c; font-weight: bold;"
         )
         
-        # --- 辅助函数：生成指标徽章列表 ---
+        # 辅助函数：生成指标徽章列表
         def _fmt_pills(keys):
             if not keys: return "<span style='color:#ccc'>None</span>"
             # 为了防止指标太多撑爆屏幕，限制显示数量 (例如只显示前 20 个，后面加 ...)
@@ -97,7 +124,7 @@ class MarsProfileReport:
                 pills += f"<span style='color:#999; font-size:0.8em'> (+{len(keys)-30} more)</span>"
             return pills
 
-        # --- 组装 HTML ---
+        # 组装 HTML
         return f"""
         <div style="border: 1px solid #e0e0e0; border-left: 5px solid #2980b9; border-radius: 4px; background: white; max-width: 900px; font-family: 'Segoe UI', sans-serif;">
             
@@ -151,14 +178,37 @@ class MarsProfileReport:
         </div>
         """
 
-    def show_overview(self, sort_by: Optional[str | List[str]] = None, ascending: bool = False) -> "pd.io.formats.style.Styler":
-        """展示全量概览大宽表"""
+    def show_overview(self, 
+                      features: Optional[Union[str, List[str]]] = None, 
+                      sort_by: Optional[Union[str, List[str]]] = None, 
+                      sort_ascending: bool = False) -> "pd.io.formats.style.Styler":
+        """
+        展示全量概览大宽表。
+
+        Parameters
+       -------
+        features : str or List[str], optional
+            需要展示的特征名列表。若为 None，则展示所有特征。
+        sort_by : str or List[str], optional
+            排序的依据列。默认先按 dtype 聚类，再按 missing_rate 排序。
+        sort_ascending : bool, default False
+            排序方向。默认降序 (False)，即把问题最严重的特征排在前面。
+        """
+        # 转换为 Pandas 副本以进行切片
+        df = self._to_pd(self.overview_table).copy()
+        
+        # 特征筛选逻辑
+        if features is not None:
+            if isinstance(features, str):
+                features = [features]
+            df = df[df["feature"].isin(features)]
 
         return self._get_styler(
-            self.overview_table,
+            df,
             title="Dataset Overview", 
             cmap="RdYlGn_r", 
             sort_by= ["dtype"] + (["missing_rate"] if sort_by is None else ([sort_by] if isinstance(sort_by, str) else sort_by)),
+            sort_ascending=sort_ascending, 
             # 指定哪些列应用“红绿灯”配色 (高值=红)
             subset_cols=["missing_rate", "zeros_rate", "unique_rate", "top1_ratio"],
             fmt_as_pct=False # 概览表混合了多种类型，不强制全转百分比，由内部逻辑细分
@@ -166,27 +216,24 @@ class MarsProfileReport:
 
     def show_trend(self, 
                    metric: str, 
-                   ascending: bool = True, 
-                   sort_by: List[str] | str = "total", 
-                   ascending_sort: bool = False) -> "pd.io.formats.style.Styler":
+                   features: Optional[Union[str, List[str]]] = None, 
+                   group_ascending: bool = True, 
+                   sort_by: Union[List[str], str] = "total", 
+                   sort_ascending: bool = False) -> "pd.io.formats.style.Styler":
         """
-        [统一接口] 展示指定指标的分组趋势。
-
-        该方法会自动根据指标类型（DQ 或 Stats）智能选择可视化模板：
-        - **DQ指标 (missing, etc.)**: 自动使用百分比格式 + 红绿灯配色 (RdYlGn_r)。
-        - **PSI**: 使用红绿灯配色 + 0.25 阈值锚定。
-        - **Stability (group_cv)**: 自动附加数据条。
-        - **常规统计 (mean, max)**: 使用蓝色热力图 (Blues)。
+        展示指定指标的分组趋势。
 
         Parameters
-        ----------
+       -------
         metric : str
             指标名称 (如 'missing', 'mean', 'psi')。
-        ascending : bool, default True
-            时间/分组列的排序方式。
+        features : str or List[str], optional
+            需要展示的特征名列表。若为 None，则展示所有特征。
+        group_ascending : bool, default True
+            分组/时间切片列的排序方向 (横向)。True 表示正序（从左到右由旧到新）。
         sort_by : str or List[str], default 'total'
             趋势表内部排序的依据列，可以是单列名或多列名列表。
-        ascending_sort : bool, default False
+        sort_ascending : bool, default False
             趋势表内部排序的方式，默认为降序。
         """
         # 路由逻辑：查找指标属于哪个表
@@ -217,8 +264,17 @@ class MarsProfileReport:
             fmt_pct = False   # PSI 是数值不是百分比
             vmin, vmax = 0.0, 0.5 # 锚定阈值
         
-        df = self._to_pd(df_raw).sort_values(by=sort_by, ascending=ascending_sort).copy()
-        df = self._reorder_trend_cols(df, ascending)
+        df = self._to_pd(df_raw).copy()
+
+        # 特征筛选逻辑
+        if features is not None:
+            if isinstance(features, str):
+                features = [features]
+            df = df[df["feature"].isin(features)]
+
+        # 排序
+        df = df.sort_values(by=sort_by, ascending=sort_ascending)
+        df = self._reorder_trend_cols(df, group_ascending=group_ascending)
 
         return self._get_styler(
             df,
@@ -230,7 +286,7 @@ class MarsProfileReport:
             add_bars=True # 所有趋势表都允许显示 CV 条
         )
 
-    def _reorder_trend_cols(self, df: pd.DataFrame, ascending: bool) -> pd.DataFrame:
+    def _reorder_trend_cols(self, df: pd.DataFrame, group_ascending: bool) -> pd.DataFrame:
         """[Internal Helper] 重新排列趋势表的列顺序。"""
         # 定义元数据列和末尾统计列
         meta_cols = ["feature", "dtype", "distribution", "top1_value"]
@@ -240,8 +296,8 @@ class MarsProfileReport:
         all_cols = df.columns.tolist()
         group_cols = [c for c in all_cols if c not in meta_cols + stat_cols]
         
-        # 排序分组列
-        group_cols_sorted = sorted(group_cols, reverse=not ascending)
+        # 排序分组列 (受 group_ascending 控制)
+        group_cols_sorted = sorted(group_cols, reverse=not group_ascending)
         
         # 组合最终顺序
         final_order = [c for c in meta_cols if c in all_cols] + \
@@ -249,8 +305,14 @@ class MarsProfileReport:
                       [c for c in stat_cols if c in all_cols]
         return df[final_order]
 
-    def write_excel(self, path: str = "mars_report.xlsx", ascending: bool = True) -> None:
-        
+    def write_excel(self, 
+                    path: str = "mars_report.xlsx", 
+                    group_ascending: bool = True,
+                    sort_by: Union[str, List[str]] = "total",
+                    sort_ascending: bool = False) -> None:
+        """
+        导出带有精美样式和趋势热力图的 Excel 报告。
+        """
         logger.info(f"📊 Exporting report to: {path}...")
         
         # 1. 依赖检查
@@ -262,96 +324,96 @@ class MarsProfileReport:
 
         try:
             with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
-                # -----------------------------------------------------------
+                #--------------------------------------------------------
                 # 1. 导出概览页 (Overview)
-                # -----------------------------------------------------------
+                #--------------------------------------------------------
                 overview_styler = self.show_overview()
                 if overview_styler is not None:
                     overview_styler.to_excel(writer, sheet_name="Overview", index=False)
                 
-                # -----------------------------------------------------------
+                #--------------------------------------------------------
                 # 2. 统一导出所有趋势页 (Trend & DQ)
-                # -----------------------------------------------------------
-                # 将 DQ 和 Stats 的 key 合并处理
+                #--------------------------------------------------------
                 dq_keys = list(self.dq_tables.keys())
                 stat_keys = list(self.stats_tables.keys())
                 all_metrics = dq_keys + stat_keys
                 
                 for metric in all_metrics:
-                    # [关键修复] 全部统一调用 show_trend
-                    styler = self.show_trend(metric, ascending=ascending)
+                    # 保证导出的表结构与 Notebook 展示完全一致
+                    styler = self.show_trend(
+                        metric, 
+                        group_ascending=group_ascending, 
+                        sort_by=sort_by, 
+                        sort_ascending=sort_ascending
+                    )
                     
                     if styler is not None:
-                        # 动态决定 Sheet 前缀
                         prefix = "DQ" if metric in self.dq_tables else "Trend"
-                        # 生成安全名称 (截断到31字符)
                         sheet_name = f"{prefix}_{metric.capitalize()}"[:31]
                         
                         styler.to_excel(writer, sheet_name=sheet_name, index=False)
                         
-                        # 应用条件格式 (PSI 颜色 / Data Bars)
-                        # 为了避免 write_excel 太长，我们将逻辑抽离到辅助函数
-                        self._apply_excel_formatting(writer, sheet_name, metric, ascending)
+                        # 确保条件格式锚定的列与导出的表完全吻合
+                        self._apply_excel_formatting(
+                            writer, sheet_name, metric, 
+                            group_ascending=group_ascending,
+                            sort_by=sort_by,
+                            sort_ascending=sort_ascending
+                        )
 
                 # 3. 自动列宽调整
                 for sheet in writer.sheets.values():
                     sheet.autofit()
                     
-            logger.info("✅ Report exported successfully.")
+            logger.info("Report exported successfully.")
 
         except Exception as e:
             logger.error(f"❌ Failed to export Excel: {e}", exc_info=True)
 
-    def _apply_excel_formatting(self, writer, sheet_name: str, metric: str, ascending: bool):
+    def _apply_excel_formatting(self, 
+                                writer, 
+                                sheet_name: str, 
+                                metric: str, 
+                                group_ascending: bool,
+                                sort_by: Union[str, List[str]],
+                                sort_ascending: bool):
         """
         [Helper] 抽离 Excel 条件格式逻辑，保持主流程清晰。
         """
-        # 我们需要获取底层的 DataFrame 来确定列索引位置
-        # 注意：需要重新获取对应的数据表并排序，以匹配 Excel 中的列顺序
         if metric in self.dq_tables:
             raw_df = self.dq_tables[metric]
         else:
             raw_df = self.stats_tables[metric]
             
-        # 转换为 Pandas 并重排，确保与 Excel 内容一致
-        df_pd = self._reorder_trend_cols(self._to_pd(raw_df), ascending)
+        # 必须和 show_trend 的内部重排逻辑一模一样，否则 Excel 样式会错位
+        df_pd: pd.DataFrame = self._to_pd(raw_df).copy()
         
-        # [优化] 动态查找时间列的索引范围，不再依赖固定顺序假设
-        # 1. 识别所有时间列
+        # 匹配行排序
+        if sort_by in df_pd.columns or (isinstance(sort_by, list) and all(c in df_pd.columns for c in sort_by)):
+            df_pd = df_pd.sort_values(by=sort_by, ascending=sort_ascending)
+            
+        # 匹配列排序
+        df_pd = self._reorder_trend_cols(df_pd, group_ascending=group_ascending)
+        
+        # [优化] 动态查找时间列的索引范围
         meta_and_stat = set(["feature", "dtype", "distribution", "top1_value", "total", "group_mean", "group_var", "group_cv"])
         time_cols = [c for c in df_pd.columns if c not in meta_and_stat]
         
         if not time_cols:
             return
 
-        # 2. 获取这些列在 Excel 中的 Excel-style 索引 (0-based)
-        col_indices = [df_pd.columns.get_loc(c) for c in time_cols]
-        start_col = min(col_indices)
-        end_col = max(col_indices)
-        
-        # 确保时间列是连续的 (通常 _reorder_trend_cols 保证了这点，但双重检查无害)
-        # 如果不连续，conditional_format 可能需要分段写，这里假设是连续的区域
-        
         worksheet = writer.sheets[sheet_name]
         
-        # 1. PSI 专用三色阶 (红绿灯)
+        # PSI 专用三色阶 (红绿灯)
         if metric == "psi":
-            # 识别中间的数据列范围 (排除 feature, dtype 等元数据)
-            # 简单的定位策略：从第3列开始(feature, dtype, distribution...) 到 倒数第4列结束
-            # 更稳健的方法是排除掉已知的非数据列
             meta_cols = ["feature", "dtype", "distribution", "top1_value"]
-            # 找到第一个不是 meta_col 的列索引
             start_col = 0
             for i, col in enumerate(df_pd.columns):
                 if col not in meta_cols:
                     start_col = i
                     break
             
-            # 排除末尾的聚合统计列
-            stat_cols = ["total", "group_mean", "group_var", "group_cv"]
             end_col = len(df_pd.columns) - 1
-            # 这里的逻辑：只对中间的分组列应用红绿灯
-            # 如果你想对 total 列也应用，可以调整 end_col
             
             worksheet.conditional_format(1, start_col, len(df_pd), end_col, {
                 'type': '3_color_scale',
@@ -360,7 +422,7 @@ class MarsProfileReport:
                 'max_type': 'num', 'max_value': 0.25, 'max_color': '#F8696B'  # Red
             })
 
-        # 2. 稳定性 Data Bars (针对 group_cv)
+        # 稳定性 Data Bars (针对 group_cv)
         if "group_cv" in df_pd.columns:
             col_idx = df_pd.columns.get_loc("group_cv")
             worksheet.conditional_format(1, col_idx, len(df_pd), col_idx, {
@@ -384,8 +446,8 @@ class MarsProfileReport:
         df_input: Any, 
         title: str, 
         cmap: str, 
-        sort_by: List[str] = None,
-        ascending: bool = False,
+        sort_by: Optional[List[str]] = None,
+        sort_ascending: bool = False, # 统一内部 API 命名
         subset_cols: Optional[List[str]] = None, 
         add_bars: bool = False, 
         fmt_as_pct: bool = False,
@@ -399,7 +461,7 @@ class MarsProfileReport:
             return None
         df: pd.DataFrame = self._to_pd(df_input)
         if sort_by is not None:
-            df = df.sort_values(by=sort_by, ascending=ascending)
+            df = df.sort_values(by=sort_by, ascending=sort_ascending) # 使用统一参数进行底层排序
         if df.empty:
             return None
 
@@ -411,7 +473,7 @@ class MarsProfileReport:
             "top1_value"
             ]
         
-        # 1. 确定色彩渐变范围
+        # 确定色彩渐变范围
         if subset_cols:
             gradient_cols: List[str] = [c for c in subset_cols if c in df.columns]
         else:
@@ -419,7 +481,7 @@ class MarsProfileReport:
 
         styler = df.style.set_caption(f"<b>{title}</b>").hide(axis="index")
         
-        # 2. 应用热力图
+        # 应用热力图
         if gradient_cols:
             styler = styler.background_gradient(
                 cmap=cmap, 
@@ -429,12 +491,12 @@ class MarsProfileReport:
                 vmax=vmax
             )
         
-        # 3. 应用数据条
+        # 应用数据条
         if add_bars and "group_cv" in df.columns:
             styler = styler.bar(subset=["group_cv"], color='#ff9999', vmin=0, vmax=1, width=90)
             styler = styler.format("{:.4f}", subset=["group_cv", "group_var"])
 
-        # 4. 数值格式化逻辑
+        # 数值格式化逻辑
         num_cols: pd.Index = df.select_dtypes(include=['number']).columns
         data_cols: List[str] = [c for c in num_cols if c not in ["group_var", "group_cv", "distribution"]]
 
@@ -457,7 +519,7 @@ class MarsProfileReport:
             if float_cols:
                 styler = styler.format(float_format, subset=float_cols)
         
-        # 5. 分布迷你图样式
+        # 分布迷你图样式
         if "distribution" in df.columns:
             styler = styler.set_table_styles([
                 {'selector': '.col_distribution', 'props': [
@@ -470,7 +532,7 @@ class MarsProfileReport:
                 ]}
             ], overwrite=False)
 
-        # 6. 全局表格外观
+        # 全局表格外观
         styler = styler.set_table_styles([
             {
                 'selector': 'th', 
@@ -486,27 +548,52 @@ class MarsProfileReport:
     
 class MarsEvaluationReport:
     """
-    [MarsEvaluationReport] 特征效能评估报告容器。
+    由 MarsBinEvaluator 生成的特征效能与稳定性评估报告容器。
 
-    该类负责存储、展示和导出特征评估结果。它支持 Polars 和 Pandas 输入，
-    并确保返回的数据类型与输入时保持一致。
+    该类是风控特征工程的核心交付物载体。它不仅负责安全存储底层极速计算出的海量评估数据，
+    还提供了一套为金融级建模场景深度定制的分析与交互接口。它智能兼容 Polars 与 Pandas 
+    双引擎，确保数据流水线的类型连贯性。
 
-    核心功能：
-    1. **交互展示**: 在 Jupyter Notebook 中提供带有热力图颜色的 Styler 对象。
-    2. **监控报警**: 自动识别高 PSI 特征并在仪表盘中预警。
-    3. **多维趋势**: 支持指标（PSI/AUC/IV/BadRate/RiskCorr）的时间序列热力图分析。
-    4. **专业导出**: 生成符合金融业务标准的带条件格式的 Excel 监控周/月报。
+    核心特性
+    --------
+    * **交互式审计 (Interactive Audit)**: 在 Jupyter 环境中渲染带业务语境色彩 
+      (如 RdYlGn_r 预警色带) 的富文本 Styler，快速扫描特征区分度与单调性缺陷。
+    * **时序趋势追踪 (Time-Series Tracking)**: 动态聚合生成 PSI、AUC、IV、坏账率及逻辑稳定性
+      (RiskCorr) 的跨期趋势热力图，精准定位特征分布漂移 (Data Drift) 的时间拐点。
+    * **生产级报表导出 (Production-Ready Export)**: 一键生成包含条件格式 (红绿灯/数据条)
+      和专业分箱排版的跨平台多 Sheet Excel 监控月报，实现从代码到业务汇报的无缝衔接。
 
     Attributes
     ----------
     summary_table : Union[pl.DataFrame, pd.DataFrame]
-        特征级汇总统计表（包含 PSI 最大/均值、AUC 均值、IV 总计等）。
+        特征级汇总审计宽表。涵盖全局预测力 (如 Total IV, Max KS, AUC) 与
+        跨期稳定性边界 (如 Max PSI, Min RiskCorr) 的核心雷达数据。
     trend_tables : Dict[str, Union[pl.DataFrame, pd.DataFrame]]
-        按指标分类的时间趋势表字典（Key 为指标名，Value 为透视后的宽表）。
+        核心评估指标的跨期趋势字典。
+        - Key: 指标名称 (如 'psi', 'auc', 'iv', 'bad_rate', 'risk_corr')。
+        - Value: 结构为 [特征名 x 时间切片] 的透视宽表 (Pivot Table)。
     detail_table : Union[pl.DataFrame, pd.DataFrame]
-        分箱明细表（包含每个特征、每个时间切片、每个分箱的样本数、坏账率等）。
+        最细粒度的分箱明细表。包含每个特征、每个时间切片下所有分箱的样本分布占比、
+        坏账率、Lift、WOE 及累积风险推演指标。
     group_col : str, optional
-        分组列名（如 'month'），用于标识趋势分析的时间维度。
+        驱动趋势分析的切片维度标识 (如 'month', 'vintage', 'channel')。
+        若处于单点快照评估模式 (Snapshot Mode)，则通常为 'Total' 或 None。
+
+    Examples
+    --------
+    >>> from mars.analysis import MarsBinEvaluator
+    >>> evaluator = MarsBinEvaluator(target="is_bad")
+    >>> report = evaluator.evaluate(df, profile_by="month")
+    >>> 
+    >>> # 1. 快速查看核心特征的全局排行与红绿灯预警
+    >>> core_features = ["age", "debt_ratio", "revolving_util"]
+    >>> report.show_summary(features=core_features)
+    >>> 
+    >>> # 2. 下钻追踪特定指标的时间序列漂移轨迹 (按全局表现降序，时间正序)
+    >>> report.show_trend("psi", sort_by="Total", sort_ascending=False, group_ascending=True)
+    >>> 
+    >>> # 3. 导出包含全量明细和色彩高亮的专业 Excel 监控报表
+    >>> report.write_excel("mars_feature_evaluation.xlsx")
     """
 
     def __init__(
@@ -520,7 +607,7 @@ class MarsEvaluationReport:
         初始化报告容器。
 
         Parameters
-        ----------
+       -------
         summary_table : Union[pl.DataFrame, pd.DataFrame]
             特征级汇总表。
         trend_tables : Dict[str, Union[pl.DataFrame, pd.DataFrame]]
@@ -534,7 +621,7 @@ class MarsEvaluationReport:
         self._summary = summary_table
         self._trend_dict = trend_tables
         self._detail = detail_table
-        self.group_col = group_col # [新增] 记录分组列名
+        self.group_col = group_col 
         
     @property
     def summary_table(self) -> Union[pl.DataFrame, pd.DataFrame]:
@@ -560,7 +647,7 @@ class MarsEvaluationReport:
         获取所有原始数据。
         
         Returns
-        -------
+       ----
         Tuple
             返回 (汇总表, 趋势表字典, 明细表)，类型与输入一致。
         """
@@ -621,11 +708,24 @@ class MarsEvaluationReport:
         </div>
         """
 
-    def show_summary(self) -> "pd.io.formats.style.Styler":
+    def show_summary(self, 
+                     features: Optional[Union[str, List[str]]] = None # 新增特征筛选
+                     ) -> "pd.io.formats.style.Styler":
         """
         展示特征汇总评分表。
+
+        Parameters
+       -------
+        features : str or List[str], optional
+            需要展示的特征名列表。若为 None，则展示所有特征。
         """
-        df = self._to_pd(self.summary_table)
+        df: pd.DataFrame = self._to_pd(self.summary_table).copy()
+        
+        # 特征筛选逻辑
+        if features is not None:
+            if isinstance(features, str):
+                features = [features]
+            df = df[df["feature"].isin(features)]
         
         # [UI 优化] 如果是多目标模式，自动将 target 列提取到最前面
         for t_col in ["target", "target_col", "y"]:
@@ -636,11 +736,13 @@ class MarsEvaluationReport:
 
         styler = df.style.set_caption("<b>Feature Performance Summary</b>").hide(axis="index")
         
-        # 1. PSI: 越低越好 (RdYlGn_r 倒序色带，红黄绿)
+        # 异常熔断：如果筛选后为空，直接返回表框架，避免底图渲染报错
+        if df.empty:
+            return styler
+        
         if "psi_max" in df.columns:
             styler = styler.background_gradient(cmap="RdYlGn_r", subset=["psi_max"], vmin=0, vmax=0.25)
             
-        # 2. 预测力指标 IV / AUC / KS: 越高越好 (RdYlGn 正序色带，绿黄红)
         if "iv" in df.columns:
             styler = styler.background_gradient(cmap="RdYlGn", subset=["iv"], vmin=0.02, vmax=0.2)
         if "auc" in df.columns:
@@ -648,68 +750,103 @@ class MarsEvaluationReport:
         if "ks" in df.columns:
             styler = styler.background_gradient(cmap="RdYlGn", subset=["ks"], vmin=5, vmax=20)
 
-        # 3. 逻辑稳定性指标 RC_min: 越接近 1 越好
         if "rc_min" in df.columns:
             styler = styler.background_gradient(cmap="RdYlGn", subset=["rc_min"], vmin=0.5, vmax=1.0)
             
-        # 4. 单调性 mono: 放弃容易引发 CSS 撕裂的 .bar()，改用经典冷暖色带
         if "mono" in df.columns:
             # coolwarm 色带: -1 为深蓝(单调递减)，0 为灰白(无单调性)，1 为深红(单调递增)
-            # 非常直观且绝对不会破坏表格的 HTML 结构！
             styler = styler.background_gradient(cmap="coolwarm", subset=["mono"], vmin=-1, vmax=1)
 
-        # 5. 格式化所有数值列保留 4 位小数
         return styler.format("{:.4f}", subset=df.select_dtypes("number").columns)
 
-    def show_trend(self, metric: str, ascending: bool = False) -> "pd.io.formats.style.Styler":
+    def show_trend(self, 
+                   metric: str, 
+                   features: Optional[Union[str, List[str]]] = None, # 新增特征筛选参数
+                   group_ascending: bool = True, 
+                   sort_by: Union[str, List[str]] = "Total", 
+                   sort_ascending: bool = False) -> "pd.io.formats.style.Styler":
         """
-        展示指标的时间趋势热力图。
+        [Interactive] 展示指标的时间趋势热力图。
+
+        渲染并返回一个带条件格式 (Conditional Formatting) 的 Pandas Styler 对象，
+        用于直观分析特征在不同时间切片（或客群分组）下的指标波动趋势。内置了针对
+        风控业务语义优化的专属色盘 (Colormap)。
+
+        Parameters
+       -------
+        metric : str
+            需要展示的指标名称。支持的选项可通过 `self.trend_tables.keys()` 查看
+            (通常包含 'psi', 'auc', 'ks', 'iv', 'bad_rate', 'risk_corr')。
+        features : str or List[str], optional
+            需要展示的特征名列表。若为 None，则展示所有特征。
+        group_ascending : bool, default True
+            分组/时间切片列的排序方向 (横向)。True 表示正序（从左到右由旧到新 / 由小到大）。
+        sort_by : str or List[str], default "Total"
+            特征行的排序依据列。默认按照全局表现 (Total) 排序。
+        sort_ascending : bool, default False
+            特征行的排序方向 (纵向)。默认降序 (False)，即把表现最差/最好的特征排在最上面。
+
+        Returns
+       ----
+        pd.io.formats.style.Styler
+            渲染完成的热力图对象。在 Jupyter Notebook 环境下会自动渲染为精美表格。
         """
         if metric not in self.trend_tables:
             raise ValueError(f"Unknown metric: {metric}. Options: {list(self.trend_tables.keys())}")
         
-        # 转换为 Pandas 副本进行样式处理
-        df = self._to_pd(self.trend_tables[metric]).copy().sort_values(by="Total", ascending=ascending)
-        # 1. 识别列类型并排序
+        # 转换为 Pandas 副本进行安全的样式处理
+        df: pd.DataFrame = self._to_pd(self.trend_tables[metric]).copy()
+        
+        # 特征筛选逻辑
+        if features is not None:
+            if isinstance(features, str):
+                features = [features]
+            df = df[df["feature"].isin(features)]
+
+        # 行排序：紧跟 sort_by 和 sort_ascending 语义
+        if sort_by in df.columns or (isinstance(sort_by, list) and all(c in df.columns for c in sort_by)):
+            df = df.sort_values(by=sort_by, ascending=sort_ascending)
+        
+        # 识别列类型并重排时间切片列
         meta_cols = ["feature", "dtype"]
         special_cols = ["Total"]
         time_cols = [c for c in df.columns if c not in meta_cols + special_cols]
-        time_cols_sorted = sorted(time_cols, reverse=not ascending)
+        
+        # 列排序：受 group_ascending 控制
+        time_cols_sorted = sorted(time_cols, reverse=not group_ascending)
 
-        # 2. 重排列顺序
+        # 组装最终的列顺序：元数据 -> 时间切片 -> 汇总列
         final_cols = [c for c in meta_cols if c in df.columns] + \
                      time_cols_sorted + \
                      [c for c in special_cols if c in df.columns]
         df = df[final_cols]
 
-        # 3. 基础样式设置
+        # 基础表格样式初始化
         styler = df.style.set_caption(f"<b>Trend Analysis: {metric.upper()}</b>").hide(axis="index")
         styler = styler.set_properties(subset=["feature"], **{'text-align': 'left', 'font-weight': 'bold'})
 
-        # 4. 根据指标类型选择配色 (关键修改点 👇)
+        if df.empty:
+            return styler # 如果筛选后为空，直接返回空表格框架，避免报错
+
+        # 根据不同业务指标的阈值与方向，映射专属渐变色盘
         if metric == "psi":
-            # PSI: 越小越绿 (RdYlGn_r)
             styler = styler.background_gradient(
                 cmap="RdYlGn_r", subset=time_cols_sorted, vmin=0, vmax=0.25, axis=None
             )
         elif metric in ["auc", "ks", "iv"]:
-            # 性能指标: 越大越绿 (RdYlGn)
             styler = styler.background_gradient(
                 cmap="RdYlGn", subset=time_cols_sorted, axis=None
             )
         elif metric == "bad_rate":
-            # 坏账率: 使用蓝色调 (Blues)
             styler = styler.background_gradient(
                 cmap="Blues", subset=time_cols_sorted, axis=None
             )
         elif metric == "risk_corr":
-            # [新增] 风险趋势相关性: 越接近 1 说明逻辑越稳定，越绿
-            # 设置 vmin=0.5，因为相关性低于 0.7 通常就需要关注了，低于 0.5 逻辑可能已崩坏
             styler = styler.background_gradient(
                 cmap="RdYlGn", subset=time_cols_sorted, vmin=0.5, vmax=1.0, axis=None
             )
 
-        # 5. 格式化所有数值列（含 Total）
+        # 统一数值精度
         format_cols = [c for c in df.select_dtypes(include=[np.number]).columns]
         return styler.format("{:.4f}", subset=format_cols)
 
@@ -719,7 +856,7 @@ class MarsEvaluationReport:
         [Professional Export] 自动化导出分箱明细表。
         
         Parameters
-        ----------
+       -------
         path : str
             导出的 Excel 文件路径。
         engine : str, default="openpyxl"
@@ -732,7 +869,7 @@ class MarsEvaluationReport:
         if engine not in valid_engines:
             raise ValueError(f"❌ 不支持的 engine: '{engine}'，请从 {valid_engines} 中选择。")
 
-        # --- 1. 智能定位模板路径 ---
+        # 智能定位模板路径
         package_name = "mars.analysis" 
         template_name_xlwings = "mars_bin_report_win_mac.xlsx"
         template_name_openpyxl = "mars_bin_report_linux.xlsx"
@@ -745,14 +882,14 @@ class MarsEvaluationReport:
             except Exception:
                 return os.path.join(os.path.dirname(os.path.abspath(__file__)), fname)
 
-        # --- 配置内部参数 ---
+        # 配置内部参数
         START_WRITE_ROW = 4
         STYLE_SOURCE_ROW = 2
         FONT_NAME = "Microsoft YaHei"
         FONT_SIZE = 8
         SHEET_NAME = "分组明细"
 
-        # --- 2. 引擎解析与初始化 ---
+        # 引擎解析与初始化
         use_xlwings = False
 
         if engine == "xlwings":
@@ -790,7 +927,7 @@ class MarsEvaluationReport:
         if not os.path.exists(template_path):
             raise FileNotFoundError(f"❌ 找不到模板文件: {template_path}")
 
-        # --- 3. 准备数据 ---
+        # 准备数据
         df_pd = self._to_pd(self.detail_table)
         total_cols = len(df_pd.columns)
 
@@ -843,7 +980,7 @@ class MarsEvaluationReport:
                     ws.range(f"{final_row + 1}:{last_used_row}").api.Delete()
 
                 wb.save(path)
-                print(f"✅ [xlwings Engine] 导出成功: {path}")
+                print(f"[xlwings Engine] 导出成功: {path}")
 
             except Exception as e:
                 raise RuntimeError(f"xlwings 导出过程出错: {e}")
@@ -916,4 +1053,4 @@ class MarsEvaluationReport:
                 ws.delete_rows(final_row + 1, ws.max_row - final_row)
 
             wb.save(path)
-            print(f"✅ [openpyxl Engine] 导出成功: {path}")
+            print(f"[openpyxl Engine] 导出成功: {path}")

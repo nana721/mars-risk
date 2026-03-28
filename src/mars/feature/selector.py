@@ -187,84 +187,195 @@ class MarsStatsSelector(MarsBaseSelector):
         # 内部状态存储
         self._stage3_binner: Optional[MarsOptimalBinner] = None
         self._feature_iv_dict: Dict[str, float] = {}  # 记录最终特征的 IV, 用于相关性过滤优选
+        
+        self._funnel_stats = []
 
     @time_it
     def fit(self, X: pl.DataFrame, y: Optional[Any] = None) -> "MarsStatsSelector":
-        """
-        [流水线执行引擎] 执行全流程特征筛选。
-        """
         X = self._ensure_polars_dataframe(X)
-        self.n_features_in_ = len(X.columns) - (1 if self.target in X.columns else 0)
+        self._funnel_stats = [] # 重置漏斗
         
-        
-        # 数据采样与初始化
-        if self.max_samples and X.height > self.max_samples:
-            logger.info(f"⚡ Downsampling data from {X.height} to {self.max_samples} rows for performance.")
-            X = X.sample(n=self.max_samples, seed=42)
-
-        # 确定需要排除的保留列
+        # 0. 初始状态
         exclude_cols = {self.target}
         if self.time_col: exclude_cols.add(self.time_col)
-        if self.profile_by and self.profile_by in X.columns: exclude_cols.add(self.profile_by)
+        if self.profile_by: exclude_cols.add(self.profile_by)
         
-        # 确定初始特征池 (Candidate Features)
-        if self.features is not None:
-            # 如果用户指定了特征池，只在指定的列表且真实存在的列中筛选，并剔除排除列
-            candidate_features = [c for c in self.features if c in X.columns and c not in exclude_cols]
-        else:
-            # 否则扫描除保留列以外的所有列
-            candidate_features = [c for c in X.columns if c not in exclude_cols]
+        candidate_features = [c for c in (self.features if self.features else X.columns) 
+                             if c in X.columns and c not in exclude_cols]
         
         # 黑名单拦截
         current_features = [c for c in candidate_features if c not in self.black_list]
-        for f in [c for c in candidate_features if c in self.black_list]:
-            self._register_decision(f, "Dropped", "Init", "Black List")
-            
-        logger.info(f"🚀 Starting MarsStatsSelector with {len(current_features)} features.")
+        self._record_funnel("Init", "Blacklist & Exclusions", 
+                           {"black_list_len": len(self.black_list)}, 
+                           len(candidate_features), len(current_features))
 
         # Stage 1: 质量清洗
         if current_features:
+            prev_count = len(current_features)
             current_features = self._filter_quality(X, current_features)
-        
-        # Stage 2: 粗筛 (Rough Scan)
-        if current_features and not self.skip_rough_scan:
-            current_features = self._filter_rough(X, current_features)
-        elif self.skip_rough_scan:
-            logger.info("⏩ Skipping Stage 2 (Rough Scan) as per configuration.")
-        
-        # Stage 3: 精选 (Fine Scan)
-        if current_features:
-            current_features = self._filter_fine(X, current_features)
             
+            # 采用逻辑表达式：必须满足 miss < thr 且 zero < thr 且 mode < thr
+            thr_msg = (
+                f"miss < {self.missing_thr} & "
+                f"zero < {self.zeros_thr} & "
+                f"mode < {self.mode_thr}"
+            )
+            
+            self._record_funnel(
+                stage="Stage 1", 
+                description="Data Quality Check", 
+                thresholds=thr_msg, 
+                count_before=prev_count, 
+                count_after=len(current_features)
+            )
+
+        # Stage 2: 粗筛 
+        if not self.skip_rough_scan and current_features:
+            prev_count = len(current_features)
+            current_features = self._filter_rough(X, current_features)
+            # 使用更直观的逻辑表达式
+            thr_msg = f"iv >= {self.rough_iv_thr} | (lift >= {self.rough_lift_thr} & sample >= {self.rough_min_sample_rate})"
+            self._record_funnel("Stage 2", "Rough Scan (Native)", thr_msg, prev_count, len(current_features))
+
+        # Stage 3: 精选 
+        if current_features:
+            prev_count = len(current_features)
+            current_features = self._filter_fine(X, current_features)
+            # 同样体现 OR 关系
+            thr_msg = f"iv >= {self.iv_thr} | (lift >= {self.lift_thr} & sample >= {self.min_sample_rate})"
+            self._record_funnel("Stage 3", "Fine Scan (Optimal)", thr_msg, prev_count, len(current_features))
+
         # Stage 4: 稳定性检查 (PSI)
         if current_features and (self.time_col or self.profile_by):
+            prev_count = len(current_features)
             current_features = self._filter_psi(X, current_features)
+            self._record_funnel(
+                stage="Stage 4", 
+                description="Stability Check (PSI)", 
+                thresholds={"psi": self.psi_thr}, 
+                count_before=prev_count, 
+                count_after=len(current_features)
+            )
 
         # Stage 5: 逻辑稳定性检查 (RiskCorr)
-        # 逻辑：只要提供了分组维度 profile_by 且 rc_thr 没被设为 None，就运行
         if current_features and (self.time_col or self.profile_by) and self.rc_thr is not None:
+            prev_count = len(current_features)
             current_features = self._filter_rc(X, current_features)
+            self._record_funnel(
+                stage="Stage 5", 
+                description="Risk Consistency (RiskCorr)", 
+                thresholds={"rc": self.rc_thr}, 
+                count_before=prev_count, 
+                count_after=len(current_features)
+            )
 
-        # Stage 6: 相关性过滤 (WOE Correlation)
-        # 逻辑：只要 corr_thr 没被设为 None，就运行
+        # Stage 6: 相关性
         if current_features and self.corr_thr is not None:
+            prev_count = len(current_features)
             current_features = self._filter_corr(X, current_features)
+            self._record_funnel("Stage 6", "Correlation Filter", 
+                               {"corr": self.corr_thr}, 
+                               prev_count, len(current_features))
 
-        # 处理白名单保送逻辑
-        final_features = []
-        for f in set(current_features + self.white_list):
-            if f in X.columns:
-                final_features.append(f)
-                if f in self.white_list and f not in current_features:
-                    self._register_decision(f, "Selected", "Final", "White List Forcing")
+        # 白名单保送
+        self.selected_features_ = list(set(current_features + self.white_list))
+        self._record_funnel("Final", "White List Forcing", 
+                           {"white_list_len": len(self.white_list)}, 
+                           len(current_features), len(self.selected_features_))
 
-        self.selected_features_ = final_features
         self._is_fitted = True
         
-        self.clear_cache()
-        
-        logger.info(f"✅ Selection Complete. Kept {len(self.selected_features_)} features out of {len(candidate_features)} scanned.")
+        # 拟合结束自动展示精美报表
+        self.show_summary()
         return self
+    
+    def _record_funnel(self, stage: str, description: str, thresholds: Union[Dict, str], count_before: int, count_after: int):
+        """记录漏斗统计快照，增强逻辑表达"""
+        if not hasattr(self, "_initial_feature_count") or self._initial_feature_count == 0:
+            self._initial_feature_count = count_before
+
+        # 如果传入的是字典，按逗号拼接；如果是字符串，直接使用
+        if isinstance(thresholds, dict):
+            thr_str = ", ".join([f"{k}={v}" for k, v in thresholds.items()])
+        else:
+            thr_str = thresholds
+
+        self._funnel_stats.append({
+            "Stage": stage,
+            "Description": description,
+            "Thresholds": thr_str,
+            "Input": count_before,
+            "Dropped": count_before - count_after,
+            "Remaining": count_after,
+            "Retention %": f"{(count_after / count_before * 100):.1f}%" if count_before > 0 else "0%",
+            "Cumulative %": f"{(count_after / self._initial_feature_count * 100):.1f}%" if self._initial_feature_count > 0 else "0%"
+        })
+    
+    def show_summary(self):
+        """[Interactive] 展示特征筛选漏斗摘要报表（全逻辑高亮版）"""
+        if not self._funnel_stats:
+            logger.warning("No funnel stats available. Run .fit() first.")
+            return
+
+        df_summary = pd.DataFrame(self._funnel_stats)
+        
+        def _color_retention(val):
+            try:
+                p = float(val.rstrip('%'))
+                if p < 30: return 'color: #d32f2f; font-weight: bold;'
+                if p < 70: return 'color: #ed6c02; font-weight: bold;'
+                return 'color: #2e7d32; font-weight: bold;'
+            except: return 'color: #757575;'
+
+        # 定义逻辑符号高亮的正则表达式/判断逻辑
+        def _style_logic_text(v):
+            if not isinstance(v, str): return ''
+            # 只要包含逻辑运算符，就给予深紫色加粗显示
+            logic_ops = ['&', '|', '<', '>', '=']
+            if any(op in v for op in logic_ops):
+                return 'color: #7b1fa2; font-weight: bold; font-family: "Courier New", Courier, monospace;'
+            return ''
+
+        styler = (
+            df_summary.style
+            .set_caption("🛡️ Mars Stats Selector: Feature Selection Funnel")
+            
+            # 1. 进度条渲染
+            .bar(subset=['Dropped'], color='#ffdbdb', vmin=0)
+            .bar(subset=['Remaining'], color='#e1f5fe', vmin=0)
+            
+            # 2. 文本对齐
+            .set_properties(**{'text-align': 'left'}, subset=['Stage', 'Description', 'Thresholds'])
+            .set_properties(**{'text-align': 'center'}, 
+                            subset=['Input', 'Dropped', 'Remaining', 'Retention %', 'Cumulative %'])
+            
+            # 3. 数值与比例颜色
+            .map(lambda v: 'color: #d32f2f; font-weight: bold;' if v > 0 else 'color: #999;', subset=['Dropped'])
+            .map(lambda v: 'color: #1565c0; font-weight: bold;', subset=['Remaining'])
+            .map(_color_retention, subset=['Retention %'])
+            .map(lambda v: 'font-weight: bold; color: #1b5e20; background-color: #f1f8e9;', subset=['Cumulative %'])
+            
+            # 4. ✅ 逻辑表达式高亮 (包含 Stage 1 的 & 逻辑)
+            .map(_style_logic_text, subset=['Thresholds'])
+
+            # 5. 全局布局样式
+            .set_table_styles([
+                {'selector': 'th', 'props': [
+                    ('background-color', '#f5f5f5'), ('color', '#333'), ('border-bottom', '2px solid #ddd'),
+                    ('padding', '12px'), ('text-align', 'center')
+                ]},
+                {'selector': 'th.col0, th.col1, th.col2', 'props': [('text-align', 'left')]},
+                {'selector': 'caption', 'props': [
+                    ('font-size', '18px'), ('font-weight', 'bold'), ('padding', '12px'), ('color', '#1a237e'), ('text-align', 'left')
+                ]}
+            ])
+        )
+
+        try:
+            from IPython.display import display
+            display(styler)
+        except ImportError:
+            print(df_summary.to_string(index=False))
 
     def _should_bypass_filter(self, feat: str) -> bool:
         """检查特征是否在白名单中，白名单特征免死"""
@@ -325,27 +436,25 @@ class MarsStatsSelector(MarsBaseSelector):
                 self._register_decision(feat, "Selected", "Quality", "Pass", missing)
                 kept_features.append(feat)
                 
-        logger.info(f"  -> {len(features) - len(kept_features)} dropped. Remaining: {len(kept_features)}")
         return kept_features
 
     def _filter_rough(self, df: pl.DataFrame, features: List[str]) -> List[str]:
-        """[Stage 2] 粗筛: 快指针 + Lift召回"""
+        """[Stage 2] 粗筛: 快指针 + Lift召回 (现已全面支持数值与类别特征)"""
         
-        # 类别特征区分: MarsNativeBinner不支持类别，直通精筛
+        if not features:
+            return []
+
+        # 自动识别类别特征列表，以便传给 Binner
         cat_types = [pl.Utf8, pl.Categorical, pl.Boolean]
         cat_features = [c for c in features if df.schema[c] in cat_types]
-        num_features = [c for c in features if c not in cat_features]
-        
-        kept_features = cat_features.copy()  # 类别特征直通
-        if cat_features:
-            logger.info(f"  -> Bypassing {len(cat_features)} categorical features to Fine Scan.")
-        
-        if not num_features:
-            return kept_features
 
-        # 针对数值特征进行快速 Native Binner 粗筛，透传特殊值
+        if cat_features:
+            logger.info(f"  -> Native Binner will also evaluate {len(cat_features)} categorical features.")
+
+        # 统一进行快速 Native Binner 粗筛 (不再保送类别特征)
         binner = MarsNativeBinner(
-            features=num_features,  
+            features=features,  # 传入所有特征
+            cat_features=cat_features, # 明确告诉 Binner 哪些是类别特征
             missing_values=self.missing_values,
             special_values=self.special_values,
             n_jobs=self.n_jobs,
@@ -354,8 +463,10 @@ class MarsStatsSelector(MarsBaseSelector):
         target = df.get_column(self.target)
         binner.fit(df, target)
         
+        # 计算粗筛分箱指标
         stats_df = binner.profile_bin_performance(df, target, update_woe=False)
         
+        # 聚合每个特征的 IV 和 Lift 表现
         lift_recall_cond = (pl.col("Lift") > self.rough_lift_thr) & (pl.col("count_dist") > self.rough_min_sample_rate)
         feat_stats = (
             stats_df.group_by("feature")
@@ -366,13 +477,18 @@ class MarsStatsSelector(MarsBaseSelector):
             ])
         ).to_dicts()
         
+        kept_features = []
+        
+        # 执行筛选判定
         for row in tqdm(feat_stats, desc="Rough Scan", leave=False):
             feat, iv, has_high_lift, max_lift = row["feature"], row["IV_total"], row["has_high_lift"], row["max_lift"]
             
+            # 白名单直接放行
             if self._should_bypass_filter(feat):
                 kept_features.append(feat)
                 continue
                 
+            # 核心决策逻辑：IV 达标 或 高 Lift 召回
             if iv > self.rough_iv_thr or has_high_lift:
                 reason = f"Pass (IV={iv:.3f})" if iv > self.rough_iv_thr else f"Pass (Lift={max_lift:.2f})"
                 self._register_decision(feat, "Selected", "Rough_Scan", reason, iv)
@@ -380,7 +496,6 @@ class MarsStatsSelector(MarsBaseSelector):
             else:
                 self._register_decision(feat, "Dropped", "Rough_Scan", "Low IV & Low Lift", iv)
 
-        logger.info(f"  -> {len(features) - len(kept_features)} dropped. Remaining: {len(kept_features)}")
         return kept_features
 
     def _filter_fine(self, df: pl.DataFrame, features: List[str]) -> List[str]:
@@ -453,6 +568,7 @@ class MarsStatsSelector(MarsBaseSelector):
                 self._register_decision(feat, "Dropped", "Fine_Scan", "Low IV & No Lift Recall", iv_total)
 
         return kept_features
+    
     def _filter_psi(self, df: pl.DataFrame, features: List[str]) -> List[str]:
         """[Stage 4] 稳定性过滤: 复用 Stage 3 binner 进行零开销分箱"""
         
@@ -478,7 +594,6 @@ class MarsStatsSelector(MarsBaseSelector):
             else:
                 self._register_decision(feat, "Dropped", "Stability", f"High PSI ({psi_val:.2f})", psi_val)
 
-        logger.info(f"  -> {len(features) - len(kept_features)} dropped. Remaining: {len(kept_features)}")
         return kept_features
 
     def _filter_rc(self, df: pl.DataFrame, features: List[str]) -> List[str]:
@@ -515,7 +630,6 @@ class MarsStatsSelector(MarsBaseSelector):
             else:
                 self._register_decision(feat, "Dropped", "RiskCorr", f"Logic Broken (RC={rc_val:.2f})", rc_val)
 
-        logger.info(f"  -> {len(features) - len(kept_features)} dropped. Remaining: {len(kept_features)}")
         return kept_features
 
     def _filter_corr(self, df: pl.DataFrame, features: List[str]) -> List[str]:

@@ -3,6 +3,7 @@
 from typing import List, Optional, Dict, Union, Any, Tuple, Literal
 from collections import defaultdict
 import inspect
+import re
 
 import polars as pl
 import numpy as np
@@ -145,11 +146,23 @@ class MarsBinEvaluator(MarsBaseEstimator):
         working_df = self._ensure_polars_dataframe(df)
         if benchmark_df is not None:
             benchmark_df = self._ensure_polars_dataframe(benchmark_df)
+            
+        # ✅ [新增] 判断是否进入“无标签模式”
+        # 允许 target 为 None 或者 target 列根本不存在
+        self.has_target_ = self.target is not None and self.target in working_df.columns
 
-        # 检查 Target 有效性，避免后续 AUC/KS 计算崩溃
-        n_unique = working_df.select(pl.col(self.target).n_unique()).item()
-        if n_unique < 2:
-            raise ValueError(f"❌ Target column '{self.target}' must have at least 2 unique values for evaluation. Found {n_unique} unique value(s).")
+        if not self.has_target_:
+            logger.info(f"🔮 Label-Free Mode: Target '{self.target}' not found. Injecting dummy target. Will only evaluate Distributions and PSI.")
+            dummy_target = self.target if self.target else "dummy_target"
+            self.target = dummy_target
+            # 临时注入全 0 标签，保护下游几百行代码不断链
+            working_df = working_df.with_columns(pl.lit(0).cast(pl.Int32).alias(self.target))
+
+        # 检查 Target 有效性 (仅在有真实标签时检查)
+        if self.has_target_:
+            n_unique = working_df.select(pl.col(self.target).n_unique()).item()
+            if n_unique < 2:
+                raise ValueError(f"❌ Target column '{self.target}' must have at least 2 unique values for evaluation.")
 
         working_df, group_col = self._prepare_context(working_df, profile_by, dt_col)
 
@@ -278,20 +291,52 @@ class MarsBinEvaluator(MarsBaseEstimator):
             stats_long = pl.concat([metrics_total, metrics_groups])
 
         # 单调性检查 (Monotonicity Check)
-        # 使用斯皮尔曼相关系数判断分箱索引与坏率的关系是否单调
         logger.debug("📉 Step 4: Checking monotonicity...")
-        monotonicity_df = (
-            stats_long
-            .filter((pl.col("bin_index") >= 0) & (pl.col(group_col) == "Total"))
-            .group_by("feature")
-            .agg(
-                pl.corr("bin_index", "bad_rate", method="spearman").fill_nan(1.0).alias("mono")
+        if self.has_target_:
+            monotonicity_df = (
+                stats_long
+                .filter((pl.col("bin_index") >= 0) & (pl.col(group_col) == "Total"))
+                .group_by("feature")
+                .agg(pl.corr("bin_index", "bad_rate", method="spearman").fill_nan(1.0).alias("mono"))
             )
-        )
+        else:
+            # 无标签时直接赋予默认单调性
+            monotonicity_df = pl.DataFrame({"feature": target_features, "mono": [1.0] * len(target_features)})
 
         report = self._format_report(
             stats_long, metrics_groups, metrics_total, group_col, monotonicity_df
         )
+
+        # ✅ [新增] 无标签模式擦除无意义的指标 (替换为 NaN，供下游 Plotter 和展示使用)
+        if not self.has_target_:
+            null_cols = ["bad", "bad_rate", "lift", "trend", "cum_bad", "cum_bad_rate", "ks_bin", "auc_bin", "iv_bin", "mono"]
+            
+            # detail_table 擦除
+            dt_cols = [c for c in null_cols if c in report.detail_table.columns]
+            if isinstance(report.detail_table, pd.DataFrame):
+                for c in dt_cols:
+                    report.detail_table[c] = np.nan
+            else:
+                report.detail_table = report.detail_table.with_columns([
+                    pl.lit(None).cast(pl.Float64).alias(c) for c in dt_cols
+                ])
+            
+            # summary_table 擦除 (注意 summary 里的列名稍有不同)
+            sum_cols = ["iv", "ks", "auc", "rc_min", "mono"]
+            sum_cols = [c for c in sum_cols if c in report.summary_table.columns]
+            if isinstance(report.summary_table, pd.DataFrame):
+                for c in sum_cols:
+                    report.summary_table[c] = np.nan
+            else:
+                report.summary_table = report.summary_table.with_columns([
+                    pl.lit(None).cast(pl.Float64).alias(c) for c in sum_cols
+                ])
+            
+            # ✅ [修复] trend_tables 擦除：无标签模式下，趋势字典里只保留 PSI
+            if "psi" in report._trend_dict:
+                report._trend_dict = {"psi": report._trend_dict["psi"]}
+            else:
+                report._trend_dict = {}
 
         logger.info(f"✅ Evaluation complete. [Features: {len(target_features)} | Groups: {stats_long[group_col].n_unique() - 1}]")
         return report
@@ -757,17 +802,21 @@ class MarsBinEvaluator(MarsBaseEstimator):
             logger.info(f"ℹ️ `dt_col` provided without `profile_by`. Defaulting trend to 'month'.")
             profile_by = "month"
 
+        # ✅ 新逻辑：支持正则匹配 'Nd' (如 '3d', '14d')
+        is_date_granularity = profile_by in ["day", "week", "month"] or (
+            isinstance(profile_by, str) and re.match(r"^\d+d$", profile_by.lower())
+        )
+
         # 处理时间切片
-        if dt_col and profile_by in ["day", "week", "month"]:
+        if dt_col and is_date_granularity:
             if profile_by == "month":
                 date_expr = MarsDate.dt2month(dt_col).alias(self.MARS_GROUP_COL)
-                return df.with_columns(date_expr), self.MARS_GROUP_COL
             elif profile_by == "week":
                 date_expr = MarsDate.dt2week(dt_col).alias(self.MARS_GROUP_COL)
-                return df.with_columns(date_expr), self.MARS_GROUP_COL
             else:
-                date_expr = MarsDate.dt2day(dt_col).alias(self.MARS_GROUP_COL)
-                return df.with_columns(date_expr), self.MARS_GROUP_COL
+                # 把未命中的 day / 3d / 14d 直接丢给 dt2day 处理
+                date_expr = MarsDate.dt2day(dt_col, interval=profile_by).alias(self.MARS_GROUP_COL)
+            return df.with_columns(date_expr), self.MARS_GROUP_COL
         
         # 常规分组：按现有列
         if profile_by:
@@ -1239,7 +1288,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
 def profile_risk(
     df: Union[pl.DataFrame, pd.DataFrame],
     *,
-    target: Union[str, List[str]], 
+    target: Optional[Union[str, List[str]]] = None, # ✅ 放宽约束
     features: Optional[List[str]] = None,
     profile_by: Optional[str] = None,
     dt_col: Optional[str] = None,
@@ -1346,9 +1395,23 @@ def profile_risk(
         - `trend_tables`: 指标趋势宽表字典 (仅包含主目标数据)。
     """
     
-    target_list = [target] if isinstance(target, str) else target
-    if not target_list:
-        raise ValueError("Target cannot be empty.")
+    # ✅ [新增] 兼容 Target 为空的模式
+    if target is None or target == []:
+        target_list = ["dummy_target"]
+        primary_target = "dummy_target"
+        is_multi_target = False
+        
+        # 安全降级：无标签无法运行 CART 或 OptBinning，强制切为无监督等频分箱
+        if binning_type == "opt" or (binner_kwargs and binner_kwargs.get("method") == "cart"):
+            logger.warning("⚠️ No target provided. Forcing binning_type='native' and method='quantile'.")
+            binning_type = "native"
+            if binner_kwargs is None: 
+                binner_kwargs = {}
+            binner_kwargs["method"] = "quantile"
+    else:
+        target_list = [target] if isinstance(target, str) else target
+        primary_target = target_list[0]
+        is_multi_target = len(target_list) > 1
     
     primary_target = target_list[0]
     is_multi_target = len(target_list) > 1

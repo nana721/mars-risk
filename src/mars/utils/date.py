@@ -88,21 +88,61 @@ class MarsDate:
         ])
 
     @staticmethod
-    def dt2day(dt: Union[str, pl.Expr]) -> pl.Expr:
+    def dt2day(dt: Union[str, pl.Expr], interval: str = "1d") -> pl.Expr:
         """
-        将日期转换为 'Day' 粒度 (即解析为标准 Date)。
+        将日期转换为指定天数粒度 (如 '1d', '3d', '14d')。
+        如果是多天 (>1d)，则以该列的最小日期 (min) 作为锚点计算区间，
+        并返回类似周粒度的字符串区间表现形式 (如 '20260101-0103')。
 
         Parameters
         ----------
         dt : Union[str, pl.Expr]
             日期列名或表达式。
+        interval : str, default "1d"
+            时间间隔，支持 "day", "1d", "3d", "14d", "30d" 等格式。
 
         Returns
         -------
         pl.Expr
-            类型为 ``pl.Date`` 的表达式。
+            当 interval 为 1d 时，返回 pl.Date 类型。
+            当 interval > 1d 时，返回 pl.Utf8 (String) 区间格式。
         """
-        return MarsDate.smart_parse_expr(dt)
+        parsed_dt = MarsDate.smart_parse_expr(dt)
+        
+        # 解析传入的 interval 参数
+        interval = interval.lower().strip()
+        if interval == "day":
+            n_days = 1
+        elif interval.endswith("d") and interval[:-1].isdigit():
+            n_days = int(interval[:-1])
+        else:
+            raise ValueError(f"Invalid interval format '{interval}'. Expected 'day' or 'Nd' (e.g., '3d', '14d').")
+
+        # 如果是 1 天，保持原样返回 pl.Date
+        if n_days == 1:
+            return parsed_dt
+            
+        # 多天逻辑 (>1d)
+        # 获取该列的全局最小日期 (锚点)
+        min_dt = parsed_dt.min()
+        
+        # 计算每一行日期与全局锚点相差的天数
+        diff_days = (parsed_dt - min_dt).dt.total_days()
+        
+        # 计算该行所属区间的起始偏移天数
+        # 数学逻辑：例如 n=3，相差 4 天 -> (4 // 3) * 3 = 3，即落在第 3 天开始的区间
+        offset_days_expr = (diff_days // n_days) * n_days
+        
+        # 动态推算区间的起止日期
+        start_of_period = min_dt + pl.duration(days=offset_days_expr)
+        end_of_period = start_of_period + pl.duration(days=n_days - 1)
+        
+        # 拼接为 "YYYYMMDD-MMDD" 的字符串格式，保持与 week 一致的视觉体验
+        return pl.concat_str([
+            start_of_period.dt.strftime("%Y%m%d"),
+            pl.lit("-"),
+            end_of_period.dt.strftime("%m%d")
+        ])
 
     @staticmethod
     def dt2week(dt: Union[str, pl.Expr]) -> pl.Expr:

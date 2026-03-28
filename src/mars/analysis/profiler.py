@@ -3,6 +3,7 @@
 import dataclasses
 from typing import List, Union, Optional, Any, Dict, Literal
 from concurrent.futures import ThreadPoolExecutor
+import re
 
 import numpy as np
 import polars as pl
@@ -287,19 +288,24 @@ class MarsDataProfiler(MarsBaseEstimator):
         working_df = self.df
         group_col = profile_by
 
+        # ✅ [新增] 识别是否是时间聚合指令 (兼容 'Nd' 格式)
+        is_date_granularity = profile_by in ["day", "week", "month"] or (
+            isinstance(profile_by, str) and bool(re.match(r"^\d+d$", profile_by.lower()))
+        )
+
         # 自动日期聚合
-        if dt_col and profile_by in ["day", "week", "month"]:
+        if dt_col and is_date_granularity:
             if dt_col not in self.df.columns:
                 raise ValueError(f"dt_col '{dt_col}' not found in DataFrame.")
             
-            if profile_by == "day":
-                date_expr = MarsDate.dt2day(dt_col)
+            # ✅ [修改] 分发路由，将 day 和 Nd 全部交给重构后的 dt2day 处理
+            if profile_by == "month":
+                date_expr = MarsDate.dt2month(dt_col)
             elif profile_by == "week":
                 date_expr = MarsDate.dt2week(dt_col)
-            elif profile_by == "month":
-                date_expr = MarsDate.dt2month(dt_col)
             else:
-                raise ValueError(f"Unsupported time grain: {profile_by}")
+                # 命中 'day', '3d', '14d' 等
+                date_expr = MarsDate.dt2day(dt_col, interval=profile_by)
 
             # 生成临时分组列名, 避免与现有列冲突
             temp_group_col = f"_mars_auto_{profile_by}"
