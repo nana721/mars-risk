@@ -85,12 +85,11 @@ class MarsDataProfiler(MarsBaseEstimator):
         missing_values: Optional[List[Union[int, float, str]]] = None,
         special_values: Optional[List[Any]] = None,
         
-        overview_batch_size: int = 500,  
-        
-        psi_batch_size: int = 50, 
         psi_n_bins: int = 10,           
         psi_bin_method: Literal["quantile", "uniform"] = "quantile", 
         psi_cv_ignore_threshold: float = 0.05,
+        psi_batch_size: int = 50, 
+        overview_batch_size: int = 500,
         
         sample_frac: Optional[float] = None, 
         
@@ -248,6 +247,8 @@ class MarsDataProfiler(MarsBaseEstimator):
             * ``enable_sparkline`` (bool): 是否计算字符画形式的迷你分布图 (默认 True)。
             * ``sparkline_sample_size`` (int): 计算分布图时的采样行数。
             * ``sparkline_bins`` (int): 分布图的分箱精度。
+            
+            **3. psi 计算**
 
         Returns
         -------
