@@ -147,7 +147,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
         if benchmark_df is not None:
             benchmark_df = self._ensure_polars_dataframe(benchmark_df)
             
-        # ✅ [新增] 判断是否进入“无标签模式”
+        # [新增] 判断是否进入“无标签模式”
         # 允许 target 为 None 或者 target 列根本不存在
         self.has_target_ = self.target is not None and self.target in working_df.columns
 
@@ -307,7 +307,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
             stats_long, metrics_groups, metrics_total, group_col, monotonicity_df
         )
 
-        # ✅ [新增] 无标签模式擦除无意义的指标 (替换为 NaN，供下游 Plotter 和展示使用)
+        # [新增] 无标签模式擦除无意义的指标 (替换为 NaN，供下游 Plotter 和展示使用)
         if not self.has_target_:
             null_cols = ["bad", "bad_rate", "lift", "trend", "cum_bad", "cum_bad_rate", "ks_bin", "auc_bin", "iv_bin", "mono"]
             
@@ -321,7 +321,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
                     pl.lit(None).cast(pl.Float64).alias(c) for c in dt_cols
                 ])
             
-            # summary_table 擦除 (注意 summary 里的列名稍有不同)
+            # summary_table 擦除
             sum_cols = ["iv", "ks", "auc", "rc_min", "mono"]
             sum_cols = [c for c in sum_cols if c in report.summary_table.columns]
             if isinstance(report.summary_table, pd.DataFrame):
@@ -332,13 +332,13 @@ class MarsBinEvaluator(MarsBaseEstimator):
                     pl.lit(None).cast(pl.Float64).alias(c) for c in sum_cols
                 ])
             
-            # ✅ [修复] trend_tables 擦除：无标签模式下，趋势字典里只保留 PSI
+            # [修复] trend_tables 擦除：无标签模式下，趋势字典里只保留 PSI
             if "psi" in report._trend_dict:
                 report._trend_dict = {"psi": report._trend_dict["psi"]}
             else:
                 report._trend_dict = {}
 
-        logger.info(f"✅ Evaluation complete. [Features: {len(target_features)} | Groups: {stats_long[group_col].n_unique() - 1}]")
+        logger.info(f"Evaluation complete. [Features: {len(target_features)} | Groups: {stats_long[group_col].n_unique() - 1}]")
         return report
 
     def _agg_basic_stats(
@@ -802,7 +802,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
             logger.info(f"ℹ️ `dt_col` provided without `profile_by`. Defaulting trend to 'month'.")
             profile_by = "month"
 
-        # ✅ 新逻辑：支持正则匹配 'Nd' (如 '3d', '14d')
+        # 新逻辑：支持正则匹配 'Nd' (如 '3d', '14d')
         is_date_granularity = profile_by in ["day", "week", "month"] or (
             isinstance(profile_by, str) and re.match(r"^\d+d$", profile_by.lower())
         )
@@ -1288,7 +1288,7 @@ class MarsBinEvaluator(MarsBaseEstimator):
 def profile_risk(
     df: Union[pl.DataFrame, pd.DataFrame],
     *,
-    target: Optional[Union[str, List[str]]] = None, # ✅ 放宽约束
+    target: Optional[Union[str, List[str]]] = None, # 放宽约束
     features: Optional[List[str]] = None,
     profile_by: Optional[str] = None,
     dt_col: Optional[str] = None,
@@ -1395,7 +1395,7 @@ def profile_risk(
         - `trend_tables`: 指标趋势宽表字典 (仅包含主目标数据)。
     """
     
-    # ✅ [新增] 兼容 Target 为空的模式
+    # [新增] 兼容 Target 为空的模式
     if target is None or target == []:
         target_list = ["dummy_target"]
         primary_target = "dummy_target"
@@ -1579,7 +1579,7 @@ def _plot_report_helper(
 
     for current_target in target_list:
         logger.info(f"📈 [Plotting Target] {current_target} ...")
-        
+         
         # 筛选当前 Target 的 Summary 数据（用于排序）
         # 注意：不同 Target 下特征的 IV/AUC 是不一样的，所以 Top 特征可能不同
         # 单目标模式下 summary 可能没有 target 列，需要兼容

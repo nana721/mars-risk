@@ -1,5 +1,8 @@
 import sys
-from .analysis import MarsDataProfiler, MarsProfileConfig, MarsBinEvaluator, profile_risk
+from .analysis import (
+    MarsDataProfiler, MarsProfileConfig, MarsProfileReport,
+    MarsBinEvaluator, MarsEvaluationReport,  profile_risk
+)
 from .feature import MarsNativeBinner, MarsOptimalBinner, MarsStatsSelector
 from .utils import logger, set_log_level
 
@@ -32,10 +35,12 @@ def __str__():
 __all__ = [
     "MarsDataProfiler",
     "MarsProfileConfig",
+    "MarsProfileReport",
     
     "MarsNativeBinner",
     "MarsOptimalBinner",
     "MarsBinEvaluator",
+    "MarsEvaluationReport",
     "profile_risk",
     
     "MarsStatsSelector",
