@@ -462,7 +462,7 @@ class MarsBinnerBase(MarsTransformer):
                 else:
                     for i in range(len(cuts) - 1):
                         low, high = cuts[i], cuts[i+1]
-                        # ✅ 调用智能格式化函数
+                        # 调用智能格式化函数
                         low_str = self._format_cut_point(low)
                         high_str = self._format_cut_point(high)
                         col_mapping[i] = f"{i:02d}_[{low_str}, {high_str})"
@@ -977,7 +977,7 @@ class MarsBinnerBase(MarsTransformer):
     
     def generate_sql(
         self, 
-        feature: str, 
+        features: Optional[Union[str, List[str]]] = None, 
         table_prefix: str = "t", 
         return_type: Literal["woe", "index", "label"] = "woe",
         map_missing: bool = True,
@@ -985,11 +985,12 @@ class MarsBinnerBase(MarsTransformer):
     ) -> str:
         """
         [Deployment] 一键将特征的分箱规则转换为标准 SQL CASE WHEN 语句。
+        支持单特征、指定多特征或一键导出全量已拟合特征的 SQL 脚本。
         
         Parameters
         ----------
-        feature : str
-            特征名称。
+        features : str or List[str], optional
+            特征名称或特征列表。若为 None，则自动导出所有已拟合的特征。
         table_prefix : str, default "t"
             表别名前缀。例如 "t" 会生成 "t.age"。若为空则直接使用特征名。
         return_type : {'woe', 'index', 'label'}, default 'woe'
@@ -999,93 +1000,105 @@ class MarsBinnerBase(MarsTransformer):
             - 'label': 输出分箱的中文/字符标签 (适合 BI 看板、数据分析或规则引擎)
         map_missing : bool, default True
             是否将缺失值映射为对应的 WOE/Index/Label。
-            - 若为 False，则遇到缺失值时直接输出 NULL（极其适合树模型原生处理）。
         map_special : bool, default True
             是否将特殊值映射为对应的 WOE/Index/Label。
-            - 若为 False，则遇到特殊值时直接保留原始值（极其适合树模型原生处理）。
             
         Returns
         -------
         str
-            标准 SQL 脚本。
+            标准 SQL 脚本（多字段间已用逗号安全分隔，可直接嵌入 SELECT 子句）。
         """
         self._check_is_fitted()
-        if feature not in self.bin_mappings_:
-            raise ValueError(f"Feature '{feature}' not found or not fitted.")
-
-        col_name = f"{table_prefix}.{feature}" if table_prefix else feature
-        lines = [f"CASE"]
         
-        mappings = self.bin_mappings_.get(feature, {})
-        woes = self.bin_woes_.get(feature, {})
-
-        def _get_output_val(idx: int) -> str:
-            """闭包内部函数：根据输出契约动态格式化 THEN 后置结果"""
-            if return_type == "woe":
-                return f"{woes.get(idx, 0.0):.4f}"
-            elif return_type == "index":
-                return str(idx)
-            else:  # label
-                label_str = mappings.get(idx, "Unknown")
-                return f"'{label_str}'"
-
-        # 处理缺失值映射，支持原生 NULL 穿透以便树模型识别默认分裂方向
-        if map_missing:
-            lines.append(f"  WHEN {col_name} IS NULL THEN {_get_output_val(self.IDX_MISSING)}")
+        # 1. 入参类型归一化
+        if features is None:
+            # 默认导出所有包含在 bin_mappings_ 中的特征
+            target_features = list(self.bin_mappings_.keys())
+        elif isinstance(features, str):
+            target_features = [features]
         else:
-            lines.append(f"  WHEN {col_name} IS NULL THEN NULL")
+            target_features = features
+
+        if not target_features:
+            return ""
+
+        # 2. 定义内部核心处理函数：生成单列的 CASE WHEN
+        def _generate_single_sql(feature: str) -> str:
+            if feature not in self.bin_mappings_:
+                raise ValueError(f"Feature '{feature}' not found or not fitted.")
+
+            col_name = f"{table_prefix}.{feature}" if table_prefix else feature
+            lines = [f"CASE"]
             
-        # 迭代特殊值分箱，通过逆序处理确保特殊值优先于正常区间被拦截
-        special_idx = [k for k in mappings.keys() if k <= self.IDX_SPECIAL_START]
-        for idx in sorted(special_idx, reverse=True):
-            # 从分箱标签中解析出原始特殊值标识
-            label = mappings[idx]
-            val_str = label.replace("Special_", "")
-            
-            # 执行类型嗅探，确保数值型特殊值不加引号，字符型特殊值合法闭合
-            try:
-                float(val_str)
-                sql_val = val_str
-            except ValueError:
-                sql_val = f"'{val_str}'"
-                
-            # 若 map_special 为 False 则直接穿透原始值，适合树模型寻找特定异常点的分裂力
-            if map_special:
-                lines.append(f"  WHEN {col_name} = {sql_val} THEN {_get_output_val(idx)}")
+            mappings = self.bin_mappings_.get(feature, {})
+            woes = self.bin_woes_.get(feature, {})
+
+            def _get_output_val(idx: int) -> str:
+                """内部函数：根据输出契约动态格式化 THEN 后置结果"""
+                if return_type == "woe":
+                    return f"{woes.get(idx, 0.0):.4f}"
+                elif return_type == "index":
+                    return str(idx)
+                else:  # label
+                    label_str = mappings.get(idx, "Unknown")
+                    return f"'{label_str}'"
+
+            # 处理缺失值
+            if map_missing:
+                lines.append(f"  WHEN {col_name} IS NULL THEN {_get_output_val(self.IDX_MISSING)}")
             else:
-                lines.append(f"  WHEN {col_name} = {sql_val} THEN {col_name}")
-
-        # 处理数值型特征切点逻辑
-        if feature in self.bin_cuts_:
-            cuts = self.bin_cuts_[feature]
-            for i in range(len(cuts) - 1):
-                upper_bound = cuts[i+1]
-                # 利用 CASE WHEN 顺序匹配的短路特性，通过左闭右开区间进行层级划分
-                if upper_bound != float('inf'):
-                    lines.append(f"  WHEN {col_name} < {upper_bound} THEN {_get_output_val(i)}")
+                lines.append(f"  WHEN {col_name} IS NULL THEN NULL")
+                
+            # 处理特殊值 (逆序保证优先级)
+            special_idx = [k for k in mappings.keys() if k <= self.IDX_SPECIAL_START]
+            for idx in sorted(special_idx, reverse=True):
+                label = mappings[idx]
+                val_str = label.replace("Special_", "")
+                
+                try:
+                    float(val_str)
+                    sql_val = val_str
+                except ValueError:
+                    sql_val = f"'{val_str}'"
+                    
+                if map_special:
+                    lines.append(f"  WHEN {col_name} = {sql_val} THEN {_get_output_val(idx)}")
                 else:
-                    lines.append(f"  ELSE {_get_output_val(i)}")
-                        
-        # 处理类别型特征的分组枚举逻辑
-        elif hasattr(self, "cat_cuts_") and feature in self.cat_cuts_:
-            groups = self.cat_cuts_[feature]
-            for i, group in enumerate(groups):
-                # 跳过长尾预处理标识，统一由末尾的 ELSE 逻辑进行归并
-                if "__Mars_Other_Pre__" in group:
-                    continue
-                # 构造 IN 表达式，将具有相似 WOE 表现的类别聚合为逻辑分组
-                in_clause = ", ".join([f"'{v}'" if isinstance(v, str) else str(v) for v in group])
-                lines.append(f"  WHEN {col_name} IN ({in_clause}) THEN {_get_output_val(i)}")
-            
-            # 将未见类别统一路由至 Other 分箱索引
-            lines.append(f"  ELSE {_get_output_val(self.IDX_OTHER)}")
+                    lines.append(f"  WHEN {col_name} = {sql_val} THEN {col_name}")
 
-        # 针对无默认 ELSE 路径的情况执行兜底，防止 SQL 语句非法
-        if "ELSE" not in "\n".join(lines):
-            lines.append(f"  ELSE {_get_output_val(self.IDX_OTHER)}")
-            
-        lines.append(f"END AS {feature}_{return_type}")
-        return "\n".join(lines)
+            # 处理数值型特征切点逻辑
+            if hasattr(self, "bin_cuts_") and feature in self.bin_cuts_:
+                cuts = self.bin_cuts_[feature]
+                for i in range(len(cuts) - 1):
+                    upper_bound = cuts[i+1]
+                    if upper_bound != float('inf'):
+                        lines.append(f"  WHEN {col_name} < {upper_bound} THEN {_get_output_val(i)}")
+                    else:
+                        lines.append(f"  ELSE {_get_output_val(i)}")
+                        
+            # 处理类别型特征逻辑
+            elif hasattr(self, "cat_cuts_") and feature in self.cat_cuts_:
+                groups = self.cat_cuts_[feature]
+                for i, group in enumerate(groups):
+                    if "__Mars_Other_Pre__" in group:
+                        continue
+                    in_clause = ", ".join([f"'{v}'" if isinstance(v, str) else str(v) for v in group])
+                    lines.append(f"  WHEN {col_name} IN ({in_clause}) THEN {_get_output_val(i)}")
+                
+                lines.append(f"  ELSE {_get_output_val(self.IDX_OTHER)}")
+
+            # 兜底逻辑
+            if "ELSE" not in "\n".join(lines):
+                lines.append(f"  ELSE {_get_output_val(self.IDX_OTHER)}")
+                
+            lines.append(f"END AS {feature}_{return_type}")
+            return "\n".join(lines)
+
+        # 3. 遍历拼接多个特征的 SQL 代码块
+        sql_blocks = [_generate_single_sql(feat) for feat in target_features]
+        
+        # 使用逗号加两个换行符拼接，使其满足 SELECT 多列的语法格式
+        return ",\n\n".join(sql_blocks)
     
     @staticmethod
     def _format_cut_point(val: float) -> str:
@@ -1147,13 +1160,13 @@ class MarsNativeBinner(MarsBinnerBase):
         self,
         features: Optional[List[str]] = None,
         *,
-        cat_features: Optional[List[str]] = None, # ✅ 新增 cat_features
+        cat_features: Optional[List[str]] = None, # 新增 cat_features
         method: Literal["cart", "quantile", "uniform"] = "cart",
         n_bins: int = 10,
         special_values: Optional[List[Union[int, float, str]]] = None,
         missing_values: Optional[List[Union[int, float, str]]] = None,
         min_bin_size: float = 0.02,
-        merge_small_bins: bool = False, # ✅ 新增：是否开启原生分箱的强制合并
+        merge_small_bins: bool = False, # 新增：是否开启原生分箱的强制合并
         cart_params: Optional[Dict[str, Any]] = None,
         remove_empty_bins: bool = False,
         n_jobs: int = -1,
@@ -1178,6 +1191,8 @@ class MarsNativeBinner(MarsBinnerBase):
             自定义缺失值列表。默认 None, NaN 会自动识别并归为 Missing 箱。
         min_bin_size: float, default=0.02
             仅在 method='cart' 时有效。决策树叶子节点的最小样本占比。
+        merge_small_bins: bool, default=False
+            quantile/uniform 分箱时，是否在原生分箱后自动合并样本量小于 min_bin_size 的小箱。
         cart_params: Dict, optional
             透传给 sklearn.tree.DecisionTreeClassifier 的额外参数。
         remove_empty_bins: bool, default=False
@@ -1187,14 +1202,14 @@ class MarsNativeBinner(MarsBinnerBase):
         """
         super().__init__(
             features=features, n_bins=n_bins, 
-            cat_features=cat_features, # ✅ 传递给父类
+            cat_features=cat_features, # 传递给父类
             special_values=special_values, 
             missing_values=missing_values,
             n_jobs=n_jobs
        )
         self.method = method
         self.min_bin_size = min_bin_size
-        self.merge_small_bins = merge_small_bins # ✅ 挂载到实例
+        self.merge_small_bins = merge_small_bins # 挂载到实例
         self.remove_empty_bins = remove_empty_bins
         
         self.cart_params = cart_params if cart_params is not None else {}
@@ -1251,7 +1266,7 @@ class MarsNativeBinner(MarsBinnerBase):
                 null_cols.append(c)
                 continue
 
-            # ✅ 分流：类别 vs 数值
+            # 分流：类别 vs 数值
             if c in cat_set or X[c].dtype in [pl.Utf8, pl.Categorical, pl.Boolean]:
                 cat_cols.append(c)
             elif self._is_numeric(X[c]):
@@ -1296,12 +1311,12 @@ class MarsNativeBinner(MarsBinnerBase):
                 elif self.method == "cart":
                     self._fit_cart_parallel(X, y, valid_num_cols)
                     
-                # ✅ [修复] CART 自带 min_samples_leaf 约束，绝不能事后干预破坏最优切点！
+                # [修复] CART 自带 min_samples_leaf 约束，绝不能事后干预破坏最优切点！
                 # 只有机械切分的 quantile 和 uniform 才需要执行事后贪心合并
                 if self.merge_small_bins and self.method in ["quantile", "uniform"]:
                     self._apply_min_bin_size(X, valid_num_cols)
 
-        # ---------------- 2. ✅ 处理类别型特征 ----------------
+        # ---------------- 2. 处理类别型特征 ----------------
         if cat_cols:
             self._fit_categorical_native(X, cat_cols)
 
@@ -1321,6 +1336,7 @@ class MarsNativeBinner(MarsBinnerBase):
             return
             
         raw_exclude = self.special_values + self.missing_values
+        total_rows = X.height  # [核心修复 1] 提取数据集的绝对总行数作为全局分母
 
         for col in valid_num_cols:
             raw_cuts = self.bin_cuts_.get(col, [])
@@ -1330,7 +1346,7 @@ class MarsNativeBinner(MarsBinnerBase):
             # 取出中间切点
             inner_cuts = sorted(raw_cuts[1:-1])
             
-            # --- 1. 获取剔除特殊值/空值后的干净数据 ---
+            # 获取剔除特殊值/空值后的干净数据 
             col_dtype = X.schema[col]
             safe_exclude = self._get_safe_values(col_dtype, raw_exclude)
             
@@ -1342,34 +1358,37 @@ class MarsNativeBinner(MarsBinnerBase):
                 valid_mask &= ~series.is_in(safe_exclude)
             
             clean_series = series.filter(valid_mask)
-            total_valid = clean_series.len()
+            clean_total = clean_series.len()
             
-            if total_valid == 0:
+            if clean_total == 0:
                 continue
                 
-            # --- 2. 向量化极速计算 CDF ---
+            # 计算 CDF -
             # 构造表达式：每个切点包含的样本数
-            exprs = [(pl.col(col) <= c).sum().alias(f"cut_{i}") for i, c in enumerate(inner_cuts)]
+            exprs = [(pl.col(col) < c).sum().alias(f"cut_{i}") for i, c in enumerate(inner_cuts)]
             
-            # 一次 Select 查出所有切点的 CDF 占比
+            # 一次 Select 查出所有切点包含的绝对样本数
             cdf_row = clean_series.to_frame().select(exprs).row(0)
-            cdf_vals = [val / total_valid for val in cdf_row]
             
-            # --- 3. 前向贪心合并逻辑 ---
+            # 使用全局 total_rows 计算全局占比，而不是干净数据的占比
+            cdf_vals = [val / total_rows for val in cdf_row]
+            
+            # 前向贪心合并
             kept_cuts = []
             last_cdf = 0.0
             
             for cut_val, cdf in zip(inner_cuts, cdf_vals):
-                # 只有当当前切点与上一个保留切点的区间占比达标时，才保留该切点
+                # 只有当当前切点与上一个保留切点的全局区间占比达标时，才保留该切点
                 if cdf - last_cdf >= self.min_bin_size:
                     kept_cuts.append(cut_val)
                     last_cdf = cdf
                     
-            # --- 4. 尾部反悔机制 (Tail Check) ---
-            # 最后一个箱子的占比是 1.0 - last_cdf
-            if kept_cuts and (1.0 - last_cdf < self.min_bin_size):
+            # 尾部反悔
+            # 尾部剩余比例 = 干净数据的全局总占比 - 最后一个切点的累计占比
+            clean_ratio = clean_total / total_rows
+            if kept_cuts and (clean_ratio - last_cdf < self.min_bin_size):
                 # 尾部不达标，直接踢掉最后一个保留切点，它会自动与倒数第二个箱子合并
-                # 且数学上保证：合并后的新尾部占比必然 >= min_bin_size
+                # 合并后的新尾部占比必然 >= min_bin_size
                 kept_cuts.pop()
                 
             # 重新装载合并后的切点
@@ -2039,7 +2058,7 @@ class MarsOptimalBinner(MarsBinnerBase):
             if c not in X.columns: continue
             
             # 优先判定类别
-            if c in cat_set:
+            if c in cat_set or X[c].dtype in [pl.Utf8, pl.Categorical, pl.Boolean] :
                 cat_cols.append(c)
                 continue
             

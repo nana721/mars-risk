@@ -6,7 +6,7 @@ from .analysis import (
 from .feature import MarsNativeBinner, MarsOptimalBinner, MarsStatsSelector
 from .utils import logger, set_log_level
 
-__version__ = "0.0.12" 
+__version__ = "0.0.13" 
 
 _BANNER = r"""
     __________________________________________________________________________

@@ -877,6 +877,55 @@ class MarsStatsSelector(MarsBaseSelector):
             
         with open(path, 'r', encoding='utf-8') as f:
             return json.load(f)
+        
+    def print_stats(self, iv_thresholds: Optional[List[float]] = None) -> None:
+        """
+        [Interactive] 打印筛选结束后的特征质量统计战报。
+        快速展示入模特征的全局 IV 分布、最高 IV 以及平均水平。
+
+        Parameters
+        ----------
+        iv_thresholds : List[float], optional
+            用于统计的 IV 阈值分档列表。如果不传，默认展示 [0.02, 0.05, 0.10]。
+        """
+        self._check_is_fitted()
+
+        if not self.selected_features_:
+            logger.warning("⚠️ No features survived the selection funnel.")
+            return
+
+        # 默认阈值与排序
+        if iv_thresholds is None:
+            iv_thresholds = [0.02, 0.05, 0.10]
+        else:
+            iv_thresholds = sorted(iv_thresholds) # 确保按从小到大排序展示
+
+        # 提取最终入选特征的 IV 列表
+        final_ivs = [self._feature_iv_dict.get(f, 0.0) for f in self.selected_features_]
+        total = len(self.selected_features_)
+        
+        max_iv = max(final_ivs) if final_ivs else 0.0
+        mean_iv = sum(final_ivs) / total if total > 0 else 0.0
+        
+        # 动态拼装打印信息
+        stats_msg = [
+            f"\n{'='*50}",
+            f"🎯 Mars Feature Selection Final Stats",
+            f"{'-'*50}",
+            f"🔹 Survived Features : {total}",
+            f"🔹 Maximum IV        : {max_iv:.4f}",
+            f"🔹 Average IV        : {mean_iv:.4f}"
+        ]
+        
+        # 动态遍历用户传入的阈值
+        for thr in iv_thresholds:
+            count = sum(1 for iv in final_ivs if iv >= thr)
+            # 使用 < 占位符保证排版对齐
+            stats_msg.append(f"🔹 IV >= {thr:<13} : {count} ({count/total:.1%})")
+            
+        stats_msg.append(f"{'='*50}")
+        
+        print("\n".join(stats_msg))
     
     
 class MarsLinearSelector(MarsBaseSelector):

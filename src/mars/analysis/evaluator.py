@@ -312,23 +312,23 @@ class MarsBinEvaluator(MarsBaseEstimator):
             null_cols = ["bad", "bad_rate", "lift", "trend", "cum_bad", "cum_bad_rate", "ks_bin", "auc_bin", "iv_bin", "mono"]
             
             # detail_table 擦除
-            dt_cols = [c for c in null_cols if c in report.detail_table.columns]
-            if isinstance(report.detail_table, pd.DataFrame):
+            dt_cols = [c for c in null_cols if c in report._detail.columns]
+            if isinstance(report._detail, pd.DataFrame):
                 for c in dt_cols:
-                    report.detail_table[c] = np.nan
+                    report._detail[c] = np.nan
             else:
-                report.detail_table = report.detail_table.with_columns([
+                report._detail = report._detail.with_columns([
                     pl.lit(None).cast(pl.Float64).alias(c) for c in dt_cols
                 ])
             
             # summary_table 擦除
             sum_cols = ["iv", "ks", "auc", "rc_min", "mono"]
-            sum_cols = [c for c in sum_cols if c in report.summary_table.columns]
-            if isinstance(report.summary_table, pd.DataFrame):
+            sum_cols = [c for c in sum_cols if c in report._summary.columns]
+            if isinstance(report._summary, pd.DataFrame):
                 for c in sum_cols:
-                    report.summary_table[c] = np.nan
+                    report._summary[c] = np.nan
             else:
-                report.summary_table = report.summary_table.with_columns([
+                report._summary = report._summary.with_columns([
                     pl.lit(None).cast(pl.Float64).alias(c) for c in sum_cols
                 ])
             
@@ -1313,7 +1313,7 @@ def profile_risk(
     
     n_jobs: int = -1,
     batch_size: int = 100
-) -> MarsEvaluationReport:
+) -> Tuple[MarsEvaluationReport, MarsBinEvaluator]:
     """
     [Mars Risk Profiler] 风险特征全景画像扫描。
     
@@ -1388,11 +1388,10 @@ def profile_risk(
 
     Returns
     -------
-    MarsEvaluationReport
-        评估报告对象。包含：
-        - `summary_table`: 特征级汇总表 (IV/AUC/PSI/Decision)。
-        - `detail_table`: 分箱级明细表 (Count/BadRate/Lift)。
-        - `trend_tables`: 指标趋势宽表字典 (仅包含主目标数据)。
+    Tuple[MarsEvaluationReport, MarsBinEvaluator]
+        - final_report: 评估报告对象。包含汇总表、明细表和趋势宽表。
+        - primary_evaluator: 训练完成的评估器对象。其内部的 `.binner` 携带了本次拟合产出的
+          全部最优分箱规则，可直接用于对新数据的 `transform` 或调用 `.generate_sql()` 部署。
     """
     
     # [新增] 兼容 Target 为空的模式
@@ -1537,7 +1536,7 @@ def profile_risk(
                 dpi=dpi
             )
             
-    return final_report
+    return final_report, primary_evaluator
 
 def _plot_report_helper(
     evaluator: MarsBinEvaluator, 

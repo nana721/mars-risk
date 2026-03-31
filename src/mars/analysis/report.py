@@ -856,7 +856,7 @@ class MarsEvaluationReport:
         [Professional Export] 自动化导出分箱明细表。
         
         Parameters
-       -------
+        -------
         path : str
             导出的 Excel 文件路径。
         engine : str, default="openpyxl"
@@ -931,7 +931,7 @@ class MarsEvaluationReport:
         df_pd = self._to_pd(self.detail_table)
         total_cols = len(df_pd.columns)
 
-        # ================= 路径 A: xlwings 写入 =================
+        # ================= 路径 A: xlwings 写入 (Win/Mac 跨平台兼容) =================
         if use_xlwings:
             app = None
             try:
@@ -950,7 +950,7 @@ class MarsEvaluationReport:
                 ws.range((START_WRITE_ROW, 1)).value = df_pd.values
                 final_row = START_WRITE_ROW + len(df_pd) - 1
                 
-                # 样式格式刷
+                # 样式格式刷 (跨平台原生写法)
                 if final_row >= START_WRITE_ROW:
                     src_row = int(STYLE_SOURCE_ROW)
                     start_row = int(START_WRITE_ROW)
@@ -961,34 +961,36 @@ class MarsEvaluationReport:
                     data_range = ws.range((start_row, 1), (end_row, max_col))
                     
                     source_range.copy()
-                    data_range.api.PasteSpecial(Paste=-4122) # xlPasteFormats
+                    data_range.paste(paste='formats') 
                 
-                # 统一字体
+                # 统一字体 (跨平台原生写法)
                 full_range = ws.range((1, 1), (final_row, total_cols))
-                full_range.api.Font.Name = FONT_NAME
-                full_range.api.Font.Size = FONT_SIZE
+                full_range.font.name = FONT_NAME
+                full_range.font.size = FONT_SIZE
                 
-                # 更新超级表 (ListObject)
-                if ws.api.ListObjects.Count > 0:
-                    table = ws.api.ListObjects(1)
-                    new_ref = ws.range((1, 1), (final_row, total_cols)).get_address(False, False)
-                    table.Resize(ws.range(new_ref).api)
+                # 更新超级表 ListObject (跨平台原生写法)
+                if len(ws.tables) > 0:
+                    table = ws.tables[0]
+                    new_ref_range = ws.range((1, 1), (final_row, total_cols))
+                    table.resize(new_ref_range)
                 
-                # 清理旧数据
-                last_used_row = ws.api.UsedRange.Rows.Count
+                # 清理旧数据 (跨平台原生写法)
+                last_used_row = ws.used_range.last_cell.row
                 if last_used_row > final_row:
-                    ws.range(f"{final_row + 1}:{last_used_row}").api.Delete()
+                    ws.range(f"{final_row + 1}:{last_used_row}").delete()
 
                 wb.save(path)
                 print(f"[xlwings Engine] 导出成功: {path}")
 
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 raise RuntimeError(f"xlwings 导出过程出错: {e}")
             finally:
                 if 'wb' in locals() and wb: wb.close()
                 if app: app.quit() 
 
-        # ================= 路径 B: openpyxl 写入 =================
+        # ================= 路径 B: openpyxl 写入 (Linux 等无界面的兜底方案) =================
         else:
             wb = openpyxl.load_workbook(template_path)
             ws = wb[SHEET_NAME]
